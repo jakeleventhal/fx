@@ -4775,6 +4775,10 @@ test "processQueuedPrompt final summary counts submitted input once across Gatew
 }
 
 test "processQueuedPrompt enables Gateway automatic caching across model families and tool steps" {
+    // Anthropic models also get fx's two stable markers, on the last
+    // repo-independent instruction and on the last stable instruction
+    // (tests/tla/prompt_context/PromptCache.tla). The turn context after
+    // them is never marked. Other families rely on the Gateway alone.
     const alloc = std.testing.allocator;
     const models = [_][]const u8{
         "anthropic/claude-sonnet-4.6",
@@ -4796,18 +4800,35 @@ test "processQueuedPrompt enables Gateway automatic caching across model familie
         var hooks = FakeAgentRuntimeDeps.init(alloc);
         defer hooks.deinit();
         hooks.runtime_context_text = "runtime context remains visible";
+        hooks.static_context_text = "static project context";
         var fixture = PromptFixture{};
         var job = fixture.job();
         job.model = @constCast(model);
         try runFakePrompt(&gateway, &hooks, fixture.config(), job);
         try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+        const anthropic = std.mem.startsWith(u8, model, "anthropic/");
         for (gateway.request_bodies.items) |body| {
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
             defer parsed.deinit();
             const options = parsed.value.object.get("providerOptions").?.object;
             try std.testing.expectEqualStrings("auto", options.get("gateway").?.object.get("caching").?.string);
-            try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
             try std.testing.expect(std.mem.find(u8, body, "runtime context remains visible") != null);
+            var marked: std.ArrayList([]const u8) = .empty;
+            defer marked.deinit(alloc);
+            for (parsed.value.object.get("prompt").?.array.items) |entry| {
+                const entry_options = entry.object.get("providerOptions") orelse continue;
+                if (entry_options.object.get("anthropic") == null) continue;
+                try std.testing.expectEqualStrings("system", entry.object.get("role").?.string);
+                try marked.append(alloc, entry.object.get("content").?.string);
+            }
+            if (anthropic) {
+                try std.testing.expectEqual(@as(usize, 2), marked.items.len);
+                try std.testing.expectEqualStrings("system", marked.items[0]);
+                try std.testing.expect(std.mem.find(u8, marked.items[1], "static project context") != null);
+            } else {
+                try std.testing.expectEqual(@as(usize, 0), marked.items.len);
+                try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
+            }
         }
         try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     }

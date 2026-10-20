@@ -10,6 +10,45 @@ pub fn capabilitiesForModel(model: []const u8) model_capabilities.Capabilities {
     return capabilities;
 }
 
+/// Whether fx sends its own Anthropic cache markers for `model`. AI Gateway's
+/// automatic caching covers every family; fx adds markers only where the
+/// provider is known to honor them.
+pub fn honorsCacheMarkers(model: []const u8) bool {
+    return std.mem.startsWith(u8, model, "anthropic/");
+}
+
+/// Whether `model` takes OpenAI's `promptCacheOptions`: GPT-5.6 and later.
+pub fn takesPromptCacheOptions(model: []const u8) bool {
+    const prefix = "openai/gpt-";
+    if (!std.mem.startsWith(u8, model, prefix)) return false;
+    const version = model[prefix.len..];
+    var end: usize = 0;
+    while (end < version.len and std.ascii.isDigit(version[end])) end += 1;
+    const major = std.fmt.parseUnsigned(u32, version[0..end], 10) catch return false;
+    if (major != 5) return major > 5;
+    if (end >= version.len or version[end] != '.') return false;
+    var minor_end = end + 1;
+    while (minor_end < version.len and std.ascii.isDigit(version[minor_end])) minor_end += 1;
+    const minor = std.fmt.parseUnsigned(u32, version[end + 1 .. minor_end], 10) catch return false;
+    return minor >= 6;
+}
+
+test "only GPT-5.6 and later take OpenAI prompt cache options" {
+    for ([_][]const u8{ "openai/gpt-5.6-luna", "openai/gpt-5.6-sol", "openai/gpt-6-sol", "openai/gpt-6.1-sol", "openai/gpt-5.10" }) |model| {
+        try std.testing.expect(takesPromptCacheOptions(model));
+    }
+    for ([_][]const u8{ "openai/gpt-5", "openai/gpt-5.5-pro", "openai/gpt-4o", "openai/gpt-oss-120b", "anthropic/claude-sonnet-5.5", "openai/gpt-", "openai/gpt-5." }) |model| {
+        try std.testing.expect(!takesPromptCacheOptions(model));
+    }
+}
+
+test "only Anthropic models take explicit cache markers" {
+    try std.testing.expect(honorsCacheMarkers("anthropic/claude-sonnet-5.5"));
+    try std.testing.expect(!honorsCacheMarkers("openai/gpt-6.1-sol"));
+    try std.testing.expect(!honorsCacheMarkers("bedrock/anthropic.claude"));
+    try std.testing.expect(!honorsCacheMarkers("anthropic"));
+}
+
 pub fn contextWindowSize(model: []const u8) ?u32 {
     if (std.mem.startsWith(u8, model, "anthropic/")) {
         const million_context_models = [_][]const u8{

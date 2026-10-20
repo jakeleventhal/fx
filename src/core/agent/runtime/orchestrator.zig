@@ -6225,12 +6225,15 @@ fn appendStablePromptContext(
     project_context: ?[]const u8,
     messages: *std.ArrayList(ChatMessage),
 ) !void {
-    for ([_][]const u8{
-        config.system_prompt,
-        config.custom_tool_guidance,
-        skill_catalog_text orelse "",
-        config.host_instructions,
-    }) |content| {
+    const start = messages.items.len;
+    for ([_][]const u8{ config.system_prompt, config.custom_tool_guidance }) |content| {
+        if (content.len > 0) try messages.append(alloc, .{ .role = .system, .content = content });
+    }
+    // The system prompt and tool guidance are the same in every workspace, so
+    // a session in another worktree or repository can read them from the
+    // cache (tests/tla/prompt_context/PromptCache.tla CrossRepoReuse).
+    markCacheBreakpoint(messages.items[start..]);
+    for ([_][]const u8{ skill_catalog_text orelse "", config.host_instructions }) |content| {
         if (content.len > 0) try messages.append(alloc, .{ .role = .system, .content = content });
     }
     if (config.model_prompt_overlay) |overlay| {
@@ -6242,6 +6245,15 @@ fn appendStablePromptContext(
         const registry = deps.context_registry orelse return error.ContextRegistryUnavailable;
         try registry.appendDefaultStatic(.{ .project_context = content }, alloc, messages);
     }
+    // The skill catalog and project rules name workspace paths. A breakpoint
+    // at the end of the stable instructions keeps them cached when only the
+    // per-step turn context after them changes (PromptCache.tla
+    // SameWorktreeReuse and ContextChangeKeepsStable).
+    markCacheBreakpoint(messages.items[start..]);
+}
+
+fn markCacheBreakpoint(stable: []ChatMessage) void {
+    if (stable.len > 0) stable[stable.len - 1].cache_breakpoint = true;
 }
 
 pub const ContextCompactionRequest = struct {

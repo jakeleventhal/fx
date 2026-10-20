@@ -1613,6 +1613,13 @@ pub const ChatMessage = struct {
     // Source provenance for compaction, never permission authority.
     context_origin: enum { ordinary, user_turn, handoff } = .ordinary,
     standalone_response: bool = false,
+    /// Ends a stable run of system instructions that a provider may cache on
+    /// its own. Set only by `appendStablePromptContext` in
+    /// `src/core/agent/runtime/orchestrator.zig`. The Gateway request writer
+    /// turns it into an explicit cache marker when the request asks for
+    /// prompt caching and the model honors such markers, and ignores it
+    /// otherwise.
+    cache_breakpoint: bool = false,
 };
 
 /// Returns a caller-owned shallow projection only when incompatible replay exists.

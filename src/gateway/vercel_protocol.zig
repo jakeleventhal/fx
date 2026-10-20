@@ -21,6 +21,11 @@ pub const StructuredResponseFormat = struct {
 
 const pending_tool_review_result_text = "Tool call has not executed; it is pending permission review.";
 
+/// Marks a system message as the end of a cacheable prefix. AI Gateway passes
+/// it to the provider alongside its own `caching: "auto"` markers; Anthropic
+/// accepts at most four markers per request, and fx adds at most two.
+const anthropic_cache_breakpoint = ",\"providerOptions\":{\"anthropic\":{\"cacheControl\":{\"type\":\"ephemeral\"}}}";
+
 pub fn roleName(role: ChatRole) []const u8 {
     return switch (role) {
         .system => "system",
@@ -352,10 +357,14 @@ fn buildGatewayRequestBodyValidated(
             if (override.message_index == i) override.images else null
         else
             null;
+        var written = message;
+        // An explicit marker belongs only to a request that asks the Gateway
+        // to cache; helpers on provider defaults send none.
+        if (!options.prompt_caching) written.cache_breakpoint = false;
         try writeChatMessageJsonInner(
             std.heap.c_allocator,
             &out.writer,
-            message,
+            written,
             budget,
             verified_images,
             &ids,
@@ -461,7 +470,8 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
         if (!allows_openai) return error.UltrafastProviderRestricted;
     }
     const gateway_options = options.fast or options.ultrafast or options.prompt_caching or routing;
-    if (!gateway_options and options.parallel_tool_calls == null) return;
+    const openai_options = options.ultrafast or options.skip_cache_writes;
+    if (!gateway_options and !openai_options and options.parallel_tool_calls == null) return;
 
     try writer.writeAll(",\"providerOptions\":{");
     if (gateway_options) {
@@ -490,16 +500,40 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
         }
         try writer.writeByte('}');
     }
-    if (options.ultrafast) {
-        try writer.writeAll(",\"openai\":{\"serviceTier\":\"ultrafast\"}");
+    if (openai_options) {
+        if (gateway_options) try writer.writeByte(',');
+        try writer.writeAll("\"openai\":{");
+        if (options.ultrafast) try writer.writeAll("\"serviceTier\":\"ultrafast\"");
+        if (options.skip_cache_writes) {
+            if (options.ultrafast) try writer.writeByte(',');
+            try writer.writeAll("\"promptCacheOptions\":{\"mode\":\"explicit\"}");
+        }
+        try writer.writeByte('}');
     }
     if (options.parallel_tool_calls) |parallel_tool_calls| {
-        if (gateway_options) try writer.writeByte(',');
+        if (gateway_options or openai_options) try writer.writeByte(',');
         try writer.writeAll("\"xai\":{\"parallelToolCalls\":");
         try writer.writeAll(if (parallel_tool_calls) "true" else "false");
         try writer.writeByte('}');
     }
     try writer.writeByte('}');
+}
+
+test "skipping cache writes asks OpenAI for explicit caching with no breakpoints" {
+    var alone: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer alone.deinit();
+    try writeProviderOptions(&alone.writer, .{ .skip_cache_writes = true });
+    try std.testing.expectEqualStrings(",\"providerOptions\":{\"openai\":{\"promptCacheOptions\":{\"mode\":\"explicit\"}}}", alone.written());
+
+    var combined: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer combined.deinit();
+    try writeProviderOptions(&combined.writer, .{ .ultrafast = true, .skip_cache_writes = true, .parallel_tool_calls = false });
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, combined.written()[",\"providerOptions\":".len..], .{});
+    defer parsed.deinit();
+    const openai = parsed.value.object.get("openai").?.object;
+    try std.testing.expectEqualStrings("ultrafast", openai.get("serviceTier").?.string);
+    try std.testing.expectEqualStrings("explicit", openai.get("promptCacheOptions").?.object.get("mode").?.string);
+    try std.testing.expect(parsed.value.object.get("xai") != null);
 }
 
 test "Ultrafast serializes only the OpenAI tier and strict OpenAI routing" {
@@ -776,6 +810,7 @@ fn writeChatMessageJsonInner(
             } else {
                 try writer.writeAll("\"\"");
             }
+            if (message.cache_breakpoint) try writer.writeAll(anthropic_cache_breakpoint);
         },
         .user => {
             try writer.writeAll(",\"content\":[");
@@ -1872,6 +1907,38 @@ test "formatGatewayRequestShapeSummary reports content kinds without request con
 
     try std.testing.expect(std.mem.find(u8, mutated_summary, "prompt.0 role=system content=array") != null);
     try std.testing.expect(std.mem.find(u8, mutated_summary, "SECRET_MUTATED_SYSTEM") == null);
+}
+
+test "Gateway request marks flagged system messages only when it asks for caching" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "stable base", .cache_breakpoint = true },
+        .{ .role = .system, .content = "workspace rules" },
+        .{ .role = .system, .content = "stable end", .cache_breakpoint = true },
+        .{ .role = .system, .content = "turn context" },
+        // Only system instructions carry markers; a flag elsewhere is ignored.
+        .{ .role = .user, .content = "hello", .cache_breakpoint = true },
+    };
+
+    const cached = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto);
+    defer alloc.free(cached);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cached, .{});
+    defer parsed.deinit();
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    try std.testing.expectEqual(@as(usize, messages.len), prompt.len);
+    for (prompt, [_]bool{ true, false, true, false, false }) |entry, marked| {
+        const options = entry.object.get("providerOptions");
+        try std.testing.expectEqual(marked, options != null);
+        if (options) |value| {
+            const control = value.object.get("anthropic").?.object.get("cacheControl").?.object;
+            try std.testing.expectEqualStrings("ephemeral", control.get("type").?.string);
+        }
+    }
+    try std.testing.expectEqualStrings("auto", parsed.value.object.get("providerOptions").?.object.get("gateway").?.object.get("caching").?.string);
+
+    const uncached = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{}, .auto);
+    defer alloc.free(uncached);
+    try std.testing.expect(std.mem.find(u8, uncached, "cacheControl") == null);
 }
 
 test "buildGatewayRequestBodyWithOptions leaves one-shot caching to the provider" {

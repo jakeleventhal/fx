@@ -9,6 +9,11 @@ pub const ResolvedProviderOptions = struct {
     ultrafast: bool = false,
     parallel_tool_calls: ?bool = null,
     prompt_caching: bool = false,
+    /// Asks OpenAI GPT-5.6 and later to write no prompt-cache entries
+    /// (explicit cache mode with no breakpoints), for a request whose prefix
+    /// no later request shares. Such a model otherwise writes the whole
+    /// prompt at the cache-write price on every call.
+    skip_cache_writes: bool = false,
     /// Borrowed gateway provider slugs in preference order. Empty leaves
     /// provider selection to the gateway. The backing memory must outlive
     /// request-body serialization.

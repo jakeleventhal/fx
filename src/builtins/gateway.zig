@@ -195,6 +195,9 @@ pub fn buildAgentRequest(
     defer alloc.free(prompt);
     @memcpy(prompt[0..request.instructions.len], request.instructions);
     @memcpy(prompt[request.instructions.len..], projected orelse request.messages);
+    if (!vercel_model_policy.honorsCacheMarkers(request.model)) {
+        for (prompt) |*message| message.cache_breakpoint = false;
+    }
 
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse
@@ -419,6 +422,34 @@ test "agent request builder keeps default reasoning silent and emits output limi
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("providerOptions") == null);
+}
+
+test "agent request builder sends stable cache markers only to Anthropic models" {
+    const alloc = std.testing.allocator;
+    const instructions = [_]shared_types.ChatMessage{
+        .{ .role = .system, .content = "stable base", .cache_breakpoint = true },
+        .{ .role = .system, .content = "turn context" },
+    };
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
+    for ([_]struct { model: []const u8, markers: usize }{
+        .{ .model = "anthropic/claude-sonnet-5.5", .markers = 1 },
+        .{ .model = "openai/gpt-6.1-sol", .markers = 0 },
+        .{ .model = "google/gemini-3-flash", .markers = 0 },
+    }) |case| {
+        var options = resolveGatewayProviderOptions(case.model, .auto, false);
+        options.prompt_caching = true;
+        const body = try buildAgentRequest(alloc, .{
+            .model = case.model,
+            .instructions = &instructions,
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = options,
+        });
+        defer alloc.free(body);
+        try std.testing.expectEqual(case.markers, std.mem.count(u8, body, "\"cacheControl\""));
+        // The caller's instructions are not modified.
+        try std.testing.expect(instructions[0].cache_breakpoint);
+    }
 }
 
 test "agent request builder scopes the product user agent to GLM 5.2" {
