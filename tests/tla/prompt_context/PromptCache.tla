@@ -30,9 +30,26 @@
 (*   "fence_after_context" the stable marker placed after the turn context;*)
 (*   "no_auto"             the manual markers without caching "auto".      *)
 (*                                                                         *)
+(* Family = "openai" models OpenAI GPT-5.6 and later instead, as its prompt  *)
+(* caching guide documents and the P8 probes in docs/cache-hardening/      *)
+(* LEDGER.md observed:                                                     *)
+(*   - implicit mode writes at the latest eligible message (a user message *)
+(*     or the last tool result of a step), and the request's explicit      *)
+(*     breakpoints write too;                                              *)
+(*   - the end of the leading developer block is reused with no marker, so *)
+(*     the model writes an entry there as well (hypothesis H2, the         *)
+(*     conservative of the two the probes allow);                          *)
+(*   - a read needs an entry ending exactly at a lookup candidate: an      *)
+(*     explicit or the implicit breakpoint, an earlier eligible message    *)
+(*     ending, or the end of the leading developer block;                  *)
+(*   - Mutation "no_auto" there is explicit-only mode: no implicit or       *)
+(*     developer-block write, and only explicit breakpoints are looked up; *)
+(*   - at most Limit breakpoints per request, the implicit one included    *)
+(*     (OpenAI: 4).                                                        *)
+(*                                                                         *)
 (* PathScoped = TRUE is fx today: the skill catalog and the project rules  *)
 (* name the worktree's absolute paths, so two worktrees of one repository  *)
-(* send different bytes there. FALSE models the same text with paths      *)
+(* send different bytes there. FALSE models the same text with paths       *)
 (* relative to the workspace root, a design option, not fx today.          *)
 (*                                                                         *)
 (* Abstraction: a block is a [k, v] record; equal v means equal bytes.     *)
@@ -50,9 +67,11 @@ CONSTANTS
   MaxSessions,  \* sessions started in one behavior
   MaxSteps,     \* model requests after the first in one session
   Limit,        \* blocks per request that may carry a cache marker
-  PathScoped    \* skill catalog and project rules embed the worktree path
+  PathScoped,   \* skill catalog and project rules embed the worktree path
+  Family        \* "anthropic" | "openai": the provider's cache rules
 
 ASSUME Design \in {"current", "proposed"}
+ASSUME Family \in {"anthropic", "openai"}
 ASSUME Mutation \in {"none", "mark_every_system", "fence_after_context", "no_auto"}
 ASSUME MaxSessions \in Nat /\ MaxSteps \in Nat /\ Limit \in Nat
 ASSUME PathScoped \in BOOLEAN
@@ -90,16 +109,47 @@ Manual(req) ==
     [] Mutation = "fence_after_context" -> {PosProfile, PosContext}
     [] OTHER -> {PosProfile, PosStable}
 
-Auto(req) == IF Mutation = "no_auto" THEN {} ELSE {Len(req), LastUser(req) - 1}
+(* The provider's own breakpoints: Gateway caching "auto" for Anthropic,    *)
+(* the implicit breakpoint for OpenAI.                                      *)
+Auto(req) ==
+  CASE Mutation = "no_auto" -> {}
+    [] Family = "anthropic" -> {Len(req), LastUser(req) - 1}
+    [] OTHER -> {Len(req)}
 
-Breakpoints(req) == Manual(req) \cup Auto(req)
+(* Breakpoints of req when its manual markers are man.                     *)
+BpsWith(req, man) == man \cup Auto(req)
 
-(* The longest written entry that is a prefix of req and ends at or before  *)
-(* one of its breakpoints.                                                  *)
+Breakpoints(req) == BpsWith(req, Manual(req))
+
+(* Positions where req leaves a cache entry.                               *)
+WritesWith(req, man) ==
+  IF Family = "openai" /\ Mutation # "no_auto"
+  THEN BpsWith(req, man) \cup {NInstr}
+  ELSE BpsWith(req, man)
+
+(* OpenAI eligible message endings after the instructions.                 *)
+Eligible(req) == {j \in (NInstr + 1)..Len(req) : req[j].k \in {"user", "asst"}}
+
+(* Anthropic: the longest written entry that is a prefix of req and ends at *)
+(* or before one of its breakpoints.                                        *)
 Hit(req, bps, c) ==
   IF bps = {} THEN 0 ELSE
     LET found == {n \in 1..Max(bps) : SubSeq(req, 1, n) \in c}
     IN IF found = {} THEN 0 ELSE Max(found)
+
+(* OpenAI: the longest written entry that ends exactly at a lookup          *)
+(* candidate of req.                                                        *)
+Candidates(req, man) ==
+  IF Mutation = "no_auto" THEN man
+  ELSE BpsWith(req, man) \cup Eligible(req) \cup {NInstr}
+
+Lookup(req, man, c) ==
+  LET found == {n \in Candidates(req, man) : SubSeq(req, 1, n) \in c}
+  IN IF found = {} THEN 0 ELSE Max(found)
+
+(* How much of req the provider reads from cache c.                        *)
+ReadWith(req, man, c) ==
+  IF Family = "anthropic" THEN Hit(req, BpsWith(req, man), c) ELSE Lookup(req, man, c)
 
 VARIABLES cache, sessions, active, log, branchOf
 vars == <<cache, sessions, active, log, branchOf>>
@@ -118,9 +168,9 @@ Init ==
 Send(w, s, br, hist, first, prev, changed) ==
   LET req == Instructions(w, br) \o hist
       bps == Breakpoints(req)
-  IN /\ cache' = cache \cup {SubSeq(req, 1, n) : n \in bps}
+  IN /\ cache' = cache \cup {SubSeq(req, 1, n) : n \in WritesWith(req, Manual(req))}
      /\ log' = Append(log, [w |-> w, s |-> s, first |-> first, req |-> req, bps |-> bps,
-                            read |-> Hit(req, bps, cache), prev |-> prev, changed |-> changed,
+                            read |-> ReadWith(req, Manual(req), cache), prev |-> prev, changed |-> changed,
                             repoSeen |-> \E i \in 1..Len(log) : RepoOf[log[i].w] = RepoOf[w],
                             worktreeSeen |-> \E i \in 1..Len(log) : log[i].w = w,
                             anySeen |-> Len(log) > 0])

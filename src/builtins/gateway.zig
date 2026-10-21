@@ -195,9 +195,8 @@ pub fn buildAgentRequest(
     defer alloc.free(prompt);
     @memcpy(prompt[0..request.instructions.len], request.instructions);
     @memcpy(prompt[request.instructions.len..], projected orelse request.messages);
-    if (!vercel_model_policy.honorsCacheMarkers(request.model)) {
-        for (prompt) |*message| message.cache_breakpoint = false;
-    }
+    var provider_options = request.provider_options;
+    provider_options.cache_markers = vercel_model_policy.cacheMarkers(request.model);
 
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse
@@ -207,7 +206,7 @@ pub fn buildAgentRequest(
             tools_json,
             prompt,
             images,
-            request.provider_options,
+            provider_options,
             request.tool_choice,
             .{
                 .name = response_format.name,
@@ -226,7 +225,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.tool_choice,
                 request.max_output_tokens,
                 active,
@@ -236,7 +235,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.tool_choice,
                 request.max_output_tokens,
             );
@@ -249,7 +248,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.max_output_tokens,
                 active,
             )
@@ -258,7 +257,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.max_output_tokens,
             );
         return finalizeAgentRequestBody(alloc, request.model, try body);
@@ -424,17 +423,19 @@ test "agent request builder keeps default reasoning silent and emits output limi
     try std.testing.expect(parsed.value.object.get("providerOptions") == null);
 }
 
-test "agent request builder sends stable cache markers only to Anthropic models" {
+test "agent request builder sends stable cache markers in each family's syntax" {
     const alloc = std.testing.allocator;
     const instructions = [_]shared_types.ChatMessage{
         .{ .role = .system, .content = "stable base", .cache_breakpoint = true },
         .{ .role = .system, .content = "turn context" },
     };
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
-    for ([_]struct { model: []const u8, markers: usize }{
-        .{ .model = "anthropic/claude-sonnet-5.5", .markers = 1 },
-        .{ .model = "openai/gpt-6.1-sol", .markers = 0 },
-        .{ .model = "google/gemini-3-flash", .markers = 0 },
+    for ([_]struct { model: []const u8, anthropic: usize, openai: usize }{
+        .{ .model = "anthropic/claude-sonnet-5.5", .anthropic = 1, .openai = 0 },
+        .{ .model = "openai/gpt-6.1-sol", .anthropic = 0, .openai = 1 },
+        .{ .model = "openai/gpt-5.6-luna", .anthropic = 0, .openai = 1 },
+        .{ .model = "openai/gpt-5", .anthropic = 0, .openai = 0 },
+        .{ .model = "google/gemini-3-flash", .anthropic = 0, .openai = 0 },
     }) |case| {
         var options = resolveGatewayProviderOptions(case.model, .auto, false);
         options.prompt_caching = true;
@@ -446,7 +447,8 @@ test "agent request builder sends stable cache markers only to Anthropic models"
             .provider_options = options,
         });
         defer alloc.free(body);
-        try std.testing.expectEqual(case.markers, std.mem.count(u8, body, "\"cacheControl\""));
+        try std.testing.expectEqual(case.anthropic, std.mem.count(u8, body, "\"cacheControl\""));
+        try std.testing.expectEqual(case.openai, std.mem.count(u8, body, "\"promptCacheBreakpoint\""));
         // The caller's instructions are not modified.
         try std.testing.expect(instructions[0].cache_breakpoint);
     }

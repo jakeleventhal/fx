@@ -10,11 +10,14 @@ pub fn capabilitiesForModel(model: []const u8) model_capabilities.Capabilities {
     return capabilities;
 }
 
-/// Whether fx sends its own Anthropic cache markers for `model`. AI Gateway's
-/// automatic caching covers every family; fx adds markers only where the
-/// provider is known to honor them.
-pub fn honorsCacheMarkers(model: []const u8) bool {
-    return std.mem.startsWith(u8, model, "anthropic/");
+/// The cache markers fx sends for `model`. AI Gateway's automatic caching
+/// covers every family; fx adds markers only where the provider honors them:
+/// Anthropic models, and OpenAI GPT-5.6 and later through explicit
+/// breakpoints.
+pub fn cacheMarkers(model: []const u8) model_capabilities.CacheMarkers {
+    if (std.mem.startsWith(u8, model, "anthropic/")) return .anthropic;
+    if (takesPromptCacheOptions(model)) return .openai;
+    return .none;
 }
 
 /// Whether `model` takes OpenAI's `promptCacheOptions`: GPT-5.6 and later.
@@ -42,11 +45,13 @@ test "only GPT-5.6 and later take OpenAI prompt cache options" {
     }
 }
 
-test "only Anthropic models take explicit cache markers" {
-    try std.testing.expect(honorsCacheMarkers("anthropic/claude-sonnet-5.5"));
-    try std.testing.expect(!honorsCacheMarkers("openai/gpt-6.1-sol"));
-    try std.testing.expect(!honorsCacheMarkers("bedrock/anthropic.claude"));
-    try std.testing.expect(!honorsCacheMarkers("anthropic"));
+test "cache markers follow the model family" {
+    try std.testing.expectEqual(.anthropic, cacheMarkers("anthropic/claude-sonnet-5.5"));
+    try std.testing.expectEqual(.openai, cacheMarkers("openai/gpt-6.1-sol"));
+    try std.testing.expectEqual(.openai, cacheMarkers("openai/gpt-5.6-luna"));
+    for ([_][]const u8{ "openai/gpt-5", "openai/gpt-5.5-pro", "bedrock/anthropic.claude", "anthropic", "google/gemini-3-flash" }) |model| {
+        try std.testing.expectEqual(.none, cacheMarkers(model));
+    }
 }
 
 pub fn contextWindowSize(model: []const u8) ?u32 {

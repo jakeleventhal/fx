@@ -4775,21 +4775,23 @@ test "processQueuedPrompt final summary counts submitted input once across Gatew
 }
 
 test "processQueuedPrompt enables Gateway automatic caching across model families and tool steps" {
-    // Anthropic models also get fx's two stable markers, on the last
-    // repo-independent instruction and on the last stable instruction
+    // Anthropic models and OpenAI GPT-5.6 and later also get fx's two stable
+    // markers, each in its provider's syntax, on the last repo-independent
+    // instruction and on the last stable instruction
     // (tests/tla/prompt_context/PromptCache.tla). The turn context after
     // them is never marked. Other families rely on the Gateway alone.
     const alloc = std.testing.allocator;
-    const models = [_][]const u8{
-        "anthropic/claude-sonnet-4.6",
-        "openai/gpt-5.6-luna",
-        "zai/glm-5.2",
-        "moonshotai/kimi-k3",
-        "google/gemini-3-flash",
-        "xai/grok-4.5",
-        "provider/new-model",
+    const cases = [_]struct { model: []const u8, markers: ?[]const u8 }{
+        .{ .model = "anthropic/claude-sonnet-4.6", .markers = "anthropic" },
+        .{ .model = "openai/gpt-5.6-luna", .markers = "openai" },
+        .{ .model = "openai/gpt-5", .markers = null },
+        .{ .model = "zai/glm-5.2", .markers = null },
+        .{ .model = "moonshotai/kimi-k3", .markers = null },
+        .{ .model = "google/gemini-3-flash", .markers = null },
+        .{ .model = "xai/grok-4.5", .markers = null },
+        .{ .model = "provider/new-model", .markers = null },
     };
-    for (models) |model| {
+    for (cases) |case| {
         const calls = [_]ToolCall{toolCall("read", "read_file", "{\"path\":\"a\"}")};
         const completions = [_]FakeCompletion{
             .{ .tool_calls = &calls },
@@ -4803,10 +4805,9 @@ test "processQueuedPrompt enables Gateway automatic caching across model familie
         hooks.static_context_text = "static project context";
         var fixture = PromptFixture{};
         var job = fixture.job();
-        job.model = @constCast(model);
+        job.model = @constCast(case.model);
         try runFakePrompt(&gateway, &hooks, fixture.config(), job);
         try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-        const anthropic = std.mem.startsWith(u8, model, "anthropic/");
         for (gateway.request_bodies.items) |body| {
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
             defer parsed.deinit();
@@ -4817,17 +4818,22 @@ test "processQueuedPrompt enables Gateway automatic caching across model familie
             defer marked.deinit(alloc);
             for (parsed.value.object.get("prompt").?.array.items) |entry| {
                 const entry_options = entry.object.get("providerOptions") orelse continue;
-                if (entry_options.object.get("anthropic") == null) continue;
+                // A marker is always in the model's own syntax, alone, on a
+                // system message.
+                const syntax = case.markers orelse return error.TestUnexpectedCacheMarker;
+                try std.testing.expectEqual(@as(usize, 1), entry_options.object.count());
+                try std.testing.expect(entry_options.object.get(syntax) != null);
                 try std.testing.expectEqualStrings("system", entry.object.get("role").?.string);
                 try marked.append(alloc, entry.object.get("content").?.string);
             }
-            if (anthropic) {
+            if (case.markers != null) {
                 try std.testing.expectEqual(@as(usize, 2), marked.items.len);
                 try std.testing.expectEqualStrings("system", marked.items[0]);
                 try std.testing.expect(std.mem.find(u8, marked.items[1], "static project context") != null);
             } else {
                 try std.testing.expectEqual(@as(usize, 0), marked.items.len);
                 try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
+                try std.testing.expect(std.mem.find(u8, body, "promptCacheBreakpoint") == null);
             }
         }
         try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);

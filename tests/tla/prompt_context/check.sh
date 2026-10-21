@@ -12,6 +12,10 @@
 # it shows what relative paths would add. Each mutant-*.cfg plants a known-bad
 # marker design that its property must catch.
 #
+# The openai-*.cfg configs check the same designs under OpenAI GPT-5.6 and later
+# rules (Family = "openai"). openai-mutant-explicit-only.cfg is the agent request
+# in explicit-only cache mode, which drops in-session reuse.
+#
 # Run the real binary and have TLC replay its requests:
 #   bun test ../drivers/prompt_context/
 #
@@ -34,4 +38,12 @@ MCPromptCache option-relative-paths - -deadlock
 MCPromptCache mutant-every-system Budget -deadlock
 MCPromptCache mutant-fence-after-context SameWorktreeReuse -deadlock
 MCPromptCache mutant-no-auto SessionReuse -deadlock
+MCPromptCache openai-proposed - -deadlock
+MCPromptCache openai-current-holds - -deadlock
+MCPromptCache openai-current-cross-repo CrossRepoReuse -deadlock
+MCPromptCache openai-current-same-worktree SameWorktreeReuse -deadlock
+MCPromptCache openai-current-context ContextChangeKeepsStable -deadlock
+MCPromptCache openai-mutant-every-system Budget -deadlock
+MCPromptCache openai-mutant-fence-after-context SameWorktreeReuse -deadlock
+MCPromptCache openai-mutant-explicit-only SessionReuse -deadlock
 EOT

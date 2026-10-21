@@ -3,10 +3,13 @@
 // 1. Each captured agent request becomes PromptCache blocks: the tools, then
 //    the stable instruction groups (base, skills, project, mcp), the turn
 //    context, the runtime notes, then one block per user message and per run
-//    of assistant and tool messages. A message-level or part-level
-//    providerOptions.anthropic.cacheControl marks the block it ends. Layout
-//    drift, a marker inside a group, or a system message after the
-//    conversation started is an abstraction error, never a guess.
+//    of assistant and tool messages. A message-level or part-level marker in
+//    the run's family syntax marks the block it ends:
+//    providerOptions.anthropic.cacheControl for Anthropic,
+//    providerOptions.openai.promptCacheBreakpoint for OpenAI. Layout drift, a
+//    marker inside a group, a marker in the other family's syntax, or a
+//    system message after the conversation started is an abstraction error,
+//    never a guess.
 // 2. The blocks become PromptCacheObserved.tla. PromptCacheTrace replays them
 //    through PromptCache's provider cache. A check passes only when TLC stops
 //    on the ReplayIncomplete sentinel: every request replayed, nothing failed.
@@ -22,6 +25,8 @@ import { TLA_ROOT, runTlc, type TlcRun } from "../lib/tlc";
 import type { CapturedRequest } from "./scenarios";
 
 export type Design = "current" | "proposed";
+/** Whose cache rules and marker syntax a run uses: PromptCache's Family. */
+export type Family = "anthropic" | "openai";
 export type Verdict = "ACCEPTED" | "REJECTED" | "INCONCLUSIVE" | "TOOL_ERROR";
 export type PropertyVerdict = "HOLDS" | "VIOLATED" | "TOOL_ERROR";
 
@@ -50,6 +55,7 @@ export interface Abstraction {
 export interface RuntimeResult {
   version: 1;
   design: Design;
+  family: Family;
   verdict: Verdict;
   detail: string;
   requests: number;
@@ -80,10 +86,16 @@ function systemKind(content: string): SystemKind {
   return "other";
 }
 
-function hasMarker(message: any): boolean {
-  if (message?.providerOptions?.anthropic?.cacheControl) return true;
+const MARKER: Record<Family, (providerOptions: any) => unknown> = {
+  anthropic: (options) => options?.anthropic?.cacheControl,
+  openai: (options) => options?.openai?.promptCacheBreakpoint,
+};
+
+function hasMarker(message: any, family: Family): boolean {
+  const marker = MARKER[family];
+  if (marker(message?.providerOptions)) return true;
   if (Array.isArray(message?.content)) {
-    return message.content.some((part: any) => part?.providerOptions?.anthropic?.cacheControl);
+    return message.content.some((part: any) => marker(part?.providerOptions));
   }
   return false;
 }
@@ -93,7 +105,7 @@ function text(message: any): string {
 }
 
 /** Turns one captured agent request body into PromptCache blocks. */
-export function abstractRequest(body: string): Abstraction {
+export function abstractRequest(body: string, family: Family): Abstraction {
   const errors: string[] = [];
   let parsed: any;
   try {
@@ -108,6 +120,10 @@ export function abstractRequest(body: string): Abstraction {
   if (Array.isArray(parsed.tools) && parsed.tools.some((tool: any) => tool?.providerOptions)) {
     errors.push("a tool carries providerOptions; tool markers are not modeled");
   }
+  const other: Family = family === "anthropic" ? "openai" : "anthropic";
+  prompt.forEach((message, n) => {
+    if (hasMarker(message, other)) errors.push(`message ${n} carries an ${other} marker on an ${family} request`);
+  });
 
   // Stable instruction groups and the overlay.
   let group = 0; // index into ORDER
@@ -147,9 +163,9 @@ export function abstractRequest(body: string): Abstraction {
     blocks.push({ k: g.kind, v: short(g.messages.map((m) => text(prompt[m])).join("\u0000")) });
     sources.push(g.messages);
     g.messages.forEach((m, n) => {
-      if (hasMarker(prompt[m]) && n !== g.messages.length - 1) errors.push(`marker inside the ${g.kind} group (message ${m})`);
+      if (hasMarker(prompt[m], family) && n !== g.messages.length - 1) errors.push(`marker inside the ${g.kind} group (message ${m})`);
     });
-    marked.push(hasMarker(prompt[g.messages.at(-1)!]));
+    marked.push(hasMarker(prompt[g.messages.at(-1)!], family));
   }
 
   // The conversation.
@@ -162,7 +178,7 @@ export function abstractRequest(body: string): Abstraction {
     if (role === "user") {
       blocks.push({ k: "user", v: short(text(prompt[i])) });
       sources.push([i]);
-      marked.push(hasMarker(prompt[i]));
+      marked.push(hasMarker(prompt[i], family));
       continue;
     }
     const last = blocks.at(-1)!;
@@ -170,11 +186,11 @@ export function abstractRequest(body: string): Abstraction {
       sources.at(-1)!.push(i);
       last.v = short(sources.at(-1)!.map((m) => text(prompt[m])).join("\u0000"));
       if (marked.at(-1)) errors.push(`marker inside an assistant run (before message ${i})`);
-      marked[marked.length - 1] = hasMarker(prompt[i]);
+      marked[marked.length - 1] = hasMarker(prompt[i], family);
     } else {
       blocks.push({ k: "asst", v: short(text(prompt[i])) });
       sources.push([i]);
-      marked.push(hasMarker(prompt[i]));
+      marked.push(hasMarker(prompt[i], family));
     }
   }
   if (!blocks.some((b) => b.k === "user")) errors.push("no user message");
@@ -183,11 +199,11 @@ export function abstractRequest(body: string): Abstraction {
 }
 
 /** Abstracts every agent request, in send order. Title requests are a separate prefix and are left out. */
-export function observe(requests: CapturedRequest[]): { observed: ObservedRequest[]; errors: string[] } {
+export function observe(requests: CapturedRequest[], family: Family): { observed: ObservedRequest[]; errors: string[] } {
   const observed: ObservedRequest[] = [];
   const errors: string[] = [];
   for (const request of requests.filter((r) => r.kind === "agent").sort((a, b) => a.seq - b.seq)) {
-    const a = abstractRequest(request.body);
+    const a = abstractRequest(request.body, family);
     for (const e of a.errors) errors.push(`request ${request.seq} (session ${request.session}): ${e}`);
     observed.push({ seq: request.seq, w: request.worktree, repo: request.repo, s: request.session, req: a.blocks, manual: a.manual });
   }
@@ -255,16 +271,27 @@ export interface TimelineRow {
 }
 
 /** Diagnostic mirror of PromptCache's provider cache. TLC decides; this explains. */
-export function simulate(observed: ObservedRequest[]): TimelineRow[] {
+export function simulate(observed: ObservedRequest[], family: Family): TimelineRow[] {
   const cache = new Set<string>();
   const key = (req: Block[], n: number) => JSON.stringify(req.slice(0, n));
   const d = derive(observed);
   return observed.map((o, n) => {
+    const sorted = (xs: number[]) => [...new Set(xs)].sort((a, b) => a - b);
     const lastUser = Math.max(...o.req.flatMap((b, j) => (b.k === "user" ? [j + 1] : [])));
-    const bps = [...new Set([...o.manual, o.req.length, lastUser - 1])].sort((a, b) => a - b);
+    let bps: number[];
     let read = 0;
-    for (let m = 1; m <= Math.max(...bps); m += 1) if (cache.has(key(o.req, m))) read = m;
-    for (const bp of bps) cache.add(key(o.req, bp));
+    if (family === "anthropic") {
+      // PromptCache Hit: any written prefix up to the furthest breakpoint.
+      bps = sorted([...o.manual, o.req.length, lastUser - 1]);
+      for (let m = 1; m <= Math.max(...bps); m += 1) if (cache.has(key(o.req, m))) read = m;
+      for (const bp of bps) cache.add(key(o.req, bp));
+    } else {
+      // PromptCache Lookup: only lookup candidates; the developer block end is written too.
+      bps = sorted([...o.manual, o.req.length]);
+      const eligible = o.req.flatMap((b, j) => (j + 1 > NINSTR && (b.k === "user" || b.k === "asst") ? [j + 1] : []));
+      for (const m of sorted([...bps, ...eligible, NINSTR])) if (cache.has(key(o.req, m))) read = m;
+      for (const bp of [...bps, NINSTR]) cache.add(key(o.req, bp));
+    }
     return { seq: o.seq, s: o.s, w: o.w, first: d[n]!.first, changed: d[n]!.changed, blocks: o.req.length, manual: o.manual, breakpoints: bps, read };
   });
 }
@@ -284,14 +311,15 @@ export function timelineMarkdown(rows: TimelineRow[]): string {
   return `${lines.join("\n")}\n`;
 }
 
-function cfg(design: Design, invariants: string[]): string {
-  return ["SPECIFICATION Spec", "CONSTANT Design = " + `"${design}"`, "INVARIANTS", ...invariants.map((x) => `  ${x}`), ""].join("\n");
+function cfg(design: Design, family: Family, invariants: string[]): string {
+  return ["SPECIFICATION Spec", "CONSTANTS", `  Design = "${design}"`, `  Family = "${family}"`, "INVARIANTS",
+    ...invariants.map((x) => `  ${x}`), ""].join("\n");
 }
 
-async function trace(dir: string, observed: ObservedRequest[], design: Design, invariants: string[]): Promise<TlcRun> {
+async function trace(dir: string, observed: ObservedRequest[], design: Design, family: Family, invariants: string[]): Promise<TlcRun> {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "PromptCacheObserved.tla"), observedModule(observed));
-  writeFileSync(join(dir, "PromptCacheTrace.cfg"), cfg(design, invariants));
+  writeFileSync(join(dir, "PromptCacheTrace.cfg"), cfg(design, family, invariants));
   return runTlc(dir, "PromptCacheTrace", "PromptCacheTrace.cfg", SPECS, tlaDir, ["-deadlock"]);
 }
 
@@ -299,17 +327,17 @@ async function trace(dir: string, observed: ObservedRequest[], design: Design, i
  * Checks the observed requests against one design: conformance first, then
  * each property on the same replay. Writes every TLC run under `reports`.
  */
-export async function checkRuntime(observed: ObservedRequest[], design: Design, reports: string): Promise<RuntimeResult> {
+export async function checkRuntime(observed: ObservedRequest[], design: Design, family: Family, reports: string): Promise<RuntimeResult> {
   const cover = coverage(observed);
   const hashes: Record<string, string> = {};
   for (const spec of SPECS) hashes[spec] = sha(readFileSync(join(tlaDir, spec), "utf8"));
-  const base: RuntimeResult = { version: 1, design, verdict: "INCONCLUSIVE", detail: "", requests: observed.length, coverage: cover, properties: {}, hashes };
+  const base: RuntimeResult = { version: 1, design, family, verdict: "INCONCLUSIVE", detail: "", requests: observed.length, coverage: cover, properties: {}, hashes };
   const missing = PROPERTIES.filter((p) => cover[p] === 0);
   if (observed.length === 0 || missing.length > 0) {
     return { ...base, detail: observed.length === 0 ? "no requests" : `no request exercises ${missing.join(", ")}` };
   }
   hashes["PromptCacheObserved.tla"] = sha(observedModule(observed));
-  const conformance = await trace(join(reports, design, "conforms"), observed, design, ["Conforms", "ReplayIncomplete"]);
+  const conformance = await trace(join(reports, design, "conforms"), observed, design, family, ["Conforms", "ReplayIncomplete"]);
   base.conformanceLog = join(reports, design, "conforms", "tlc.log");
   if (conformance.violated === "Conforms") return { ...base, verdict: "REJECTED", detail: `requests do not match the ${design} layout and markers` };
   if (conformance.violated !== "ReplayIncomplete") {
@@ -317,7 +345,7 @@ export async function checkRuntime(observed: ObservedRequest[], design: Design, 
   }
   for (const property of PROPERTIES) {
     const dir = join(reports, design, property);
-    const run = await trace(dir, observed, design, ["Conforms", property, "ReplayIncomplete"]);
+    const run = await trace(dir, observed, design, family, ["Conforms", property, "ReplayIncomplete"]);
     const verdict: PropertyVerdict = run.violated === "ReplayIncomplete" ? "HOLDS" : run.violated === property ? "VIOLATED" : "TOOL_ERROR";
     base.properties[property] = { verdict, log: join(dir, "tlc.log"), ...(verdict === "TOOL_ERROR" ? { detail: run.output.slice(-400) } : {}) };
   }

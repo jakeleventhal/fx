@@ -17,7 +17,7 @@
 (***************************************************************************)
 EXTENDS PromptCacheObserved, Naturals, Sequences, FiniteSets, TLC
 
-CONSTANT Design
+CONSTANTS Design, Family
 
 VARIABLES i, cache, log
 vars == <<i, cache, log>>
@@ -52,10 +52,10 @@ Next ==
   /\ LET n == i + 1
          o == Observed[n]
          b == Before(n)
-         bps == o.manual \cup PC!Auto(o.req)
-     IN /\ cache' = cache \cup {SubSeq(o.req, 1, m) : m \in bps}
+         bps == PC!BpsWith(o.req, o.manual)
+     IN /\ cache' = cache \cup {SubSeq(o.req, 1, m) : m \in PC!WritesWith(o.req, o.manual)}
         /\ log' = Append(log, [w |-> o.w, s |-> o.s, first |-> b = 0, req |-> o.req, bps |-> bps,
-                               read |-> PC!Hit(o.req, bps, cache),
+                               read |-> PC!ReadWith(o.req, o.manual, cache),
                                prev |-> IF b = 0 THEN <<>> ELSE Observed[b].req,
                                changed |-> b # 0 /\ Ctx(o.req) # Ctx(Observed[b].req),
                                repoSeen |-> \E j \in 1..i : Observed[j].repo = o.repo,
