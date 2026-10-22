@@ -20,6 +20,13 @@ pub fn cacheMarkers(model: []const u8) model_capabilities.CacheMarkers {
     return .none;
 }
 
+/// Whether `model` takes only one system message, at the start. Qwen's chat
+/// template rejects a second one once a tool call is in the history ("System
+/// message must be at the beginning").
+pub fn singleSystemMessage(model: []const u8) bool {
+    return std.mem.startsWith(u8, model, "alibaba/");
+}
+
 /// Whether fx sends `model` a context note, a system message after the
 /// conversation starts (D93): only the families fx sends cache markers to,
 /// which take such a message without rewriting the cached prefix.
@@ -49,6 +56,14 @@ test "only GPT-5.6 and later take OpenAI prompt cache options" {
     }
     for ([_][]const u8{ "openai/gpt-5", "openai/gpt-5.5-pro", "openai/gpt-4o", "openai/gpt-oss-120b", "anthropic/claude-sonnet-5.5", "openai/gpt-", "openai/gpt-5." }) |model| {
         try std.testing.expect(!takesPromptCacheOptions(model));
+    }
+}
+
+test "only Qwen models take their instructions as one system message" {
+    try std.testing.expect(singleSystemMessage("alibaba/qwen3.8-max"));
+    try std.testing.expect(singleSystemMessage("alibaba/qwen3.7-plus"));
+    for ([_][]const u8{ "anthropic/claude-sonnet-5.5", "openai/gpt-6.1-sol", "spacexai/grok-4.7", "zai/glm-5.3", "moonshotai/kimi-k3", "google/gemini-4-argon", "deepseek/deepseek-v4.1-flash", "minimax/minimax-m3" }) |model| {
+        try std.testing.expect(!singleSystemMessage(model));
     }
 }
 

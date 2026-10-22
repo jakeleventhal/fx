@@ -104,7 +104,10 @@ fn buildGatewayReview(
         instructions,
         messages,
         target_call_id,
-        .{ .skip_cache_writes = vercel_model_policy.takesPromptCacheOptions(model) },
+        .{
+            .skip_cache_writes = vercel_model_policy.takesPromptCacheOptions(model),
+            .single_system_message = vercel_model_policy.singleSystemMessage(model),
+        },
         2048,
         deadline,
         cancel_flag,
@@ -424,6 +427,31 @@ test "gateway review asks GPT-5.6 and later to skip cache writes" {
         try std.testing.expectEqual(case.skip, std.mem.find(u8, body, "\"promptCacheOptions\":{\"mode\":\"explicit\"}") != null);
         // A review never asks the Gateway to cache.
         try std.testing.expect(std.mem.find(u8, body, "\"caching\"") == null);
+    }
+}
+
+test "gateway review sends Qwen its instructions as one system message" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1000),
+    });
+    const instructions = [_]types.ChatMessage{
+        .{ .role = .system, .content = "Review the pending call." },
+        .{ .role = .system, .content = "Review policy details." },
+    };
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "review_context_kind: normal\n" },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "call", .name = "shell", .arguments_json = "{}" }} },
+    };
+    for ([_]struct { model: []const u8, systems: usize }{
+        .{ .model = "alibaba/qwen3.8-max", .systems = 1 },
+        .{ .model = "zai/glm-5.3", .systems = 2 },
+    }) |case| {
+        var unused: u8 = 0;
+        const body = try buildGatewayReview(@ptrCast(&unused), std.testing.allocator, case.model, "[]", &instructions, &messages, "call", deadline, &cancel);
+        defer std.testing.allocator.free(body);
+        try std.testing.expectEqual(case.systems, std.mem.count(u8, body, "{\"role\":\"system\""));
     }
 }
 

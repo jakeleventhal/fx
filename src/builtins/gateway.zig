@@ -198,6 +198,7 @@ pub fn buildAgentRequest(
     @memcpy(prompt[request.instructions.len..], projected orelse request.messages);
     var provider_options = request.provider_options;
     provider_options.cache_markers = vercel_model_policy.cacheMarkers(request.model);
+    provider_options.single_system_message = vercel_model_policy.singleSystemMessage(request.model);
 
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse
@@ -497,6 +498,31 @@ test "agent requests carry context notes only to the families that take them, wi
     try std.testing.expectEqual(@as(usize, 1), (try other.contextNoteMessages(arena, "anthropic/claude-sonnet-5.5", &messages)).len);
     // Without notes, the request's messages are the caller's own.
     try std.testing.expect((try other.contextNoteMessages(arena, "openai/gpt-5", messages[0..1])).ptr == (&messages).ptr);
+}
+
+test "agent requests to Qwen send the instructions as one system message" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const instructions = [_]shared_types.ChatMessage{
+        .{ .role = .system, .content = "stable base" },
+        .{ .role = .system, .content = "turn context" },
+    };
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
+    for ([_]struct { model: []const u8, systems: usize }{
+        .{ .model = "alibaba/qwen3.8-max", .systems = 1 },
+        .{ .model = "zai/glm-5.3", .systems = 2 },
+    }) |case| {
+        const body = try buildAgentRequest(arena, .{
+            .model = case.model,
+            .instructions = &instructions,
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = resolveGatewayProviderOptions(case.model, .auto, false),
+        });
+        try std.testing.expectEqual(case.systems, std.mem.count(u8, body, "{\"role\":\"system\""));
+    }
 }
 
 test "agent request builder scopes the product user agent to GLM 5.2" {

@@ -318,6 +318,28 @@ fn reasoningWireValue(label: []const u8) []const u8 {
     return label;
 }
 
+/// Writes the leading system messages as one, in order and joined by a blank
+/// line, for a model that takes a single system message. Returns how many
+/// messages it wrote, 0 when the prompt starts with another role. Such a model
+/// takes no cache markers, so none is lost.
+fn writeJoinedLeadingSystem(alloc: std.mem.Allocator, writer: *std.Io.Writer, messages: []const ChatMessage) !usize {
+    var end: usize = 0;
+    while (end < messages.len and messages[end].role == .system and !messages[end].context_note) end += 1;
+    if (end == 0) return 0;
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(alloc);
+    for (messages[0..end]) |message| {
+        const content = message.content orelse continue;
+        if (content.len > 0) try parts.append(alloc, content);
+    }
+    const joined = try std.mem.join(alloc, "\n\n", parts.items);
+    defer alloc.free(joined);
+    try writer.writeAll("{\"role\":\"system\",\"content\":");
+    try std.json.Stringify.value(joined, .{}, writer);
+    try writer.writeByte('}');
+    return end;
+}
+
 fn buildGatewayRequestBodyValidated(
     alloc: std.mem.Allocator,
     tools_json: []const u8,
@@ -347,6 +369,7 @@ fn buildGatewayRequestBodyValidated(
 
     try out.writer.writeAll("{\"prompt\":[");
     var i: usize = 0;
+    if (options.single_system_message) i = try writeJoinedLeadingSystem(alloc, &out.writer, messages);
     while (i < messages.len) {
         const message = messages[i];
         if (budget) |active| try active.check();
@@ -1918,6 +1941,35 @@ test "formatGatewayRequestShapeSummary reports content kinds without request con
 
     try std.testing.expect(std.mem.find(u8, mutated_summary, "prompt.0 role=system content=array") != null);
     try std.testing.expect(std.mem.find(u8, mutated_summary, "SECRET_MUTATED_SYSTEM") == null);
+}
+
+test "a model that takes one system message gets the leading instructions joined, in order" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "read_file", .arguments_json = "{}" }};
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "stable base" },
+        .{ .role = .system, .content = "" },
+        .{ .role = .system, .content = "turn context" },
+        .{ .role = .user, .content = "hello" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "ok", .tool_call_id = "call_1", .tool_name = "read_file" },
+    };
+    for ([_]bool{ true, false }) |single| {
+        const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{ .single_system_message = single }, .auto);
+        defer alloc.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        const prompt = parsed.value.object.get("prompt").?.array.items;
+        var systems: usize = 0;
+        for (prompt) |entry| systems += @intFromBool(std.mem.eql(u8, entry.object.get("role").?.string, "system"));
+        try std.testing.expectEqual(@as(usize, if (single) 1 else 3), systems);
+        if (single) {
+            // The stable text comes first, so the cached prefix still holds.
+            try std.testing.expectEqualStrings("stable base\n\nturn context", prompt[0].object.get("content").?.string);
+            try std.testing.expectEqualStrings("user", prompt[1].object.get("role").?.string);
+            try std.testing.expectEqual(@as(usize, 4), prompt.len);
+        }
+    }
 }
 
 test "Gateway request marks flagged system messages in the requested syntax only when it asks for caching" {

@@ -21,6 +21,9 @@ pub const ResolvedProviderOptions = struct {
     /// no later request shares. Such a model otherwise writes the whole
     /// prompt at the cache-write price on every call.
     skip_cache_writes: bool = false,
+    /// The model takes one system message, at the start of the conversation,
+    /// so the Gateway request joins the leading system messages into one.
+    single_system_message: bool = false,
     /// Borrowed gateway provider slugs in preference order. Empty leaves
     /// provider selection to the gateway. The backing memory must outlive
     /// request-body serialization.
