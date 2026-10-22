@@ -54,4 +54,6 @@ MCPromptCache p6-current-deliver MidSessionKeepsHistory -deadlock
 MCPromptCache p6-current-skill MidSessionKeepsHistory -deadlock
 MCPromptCache p6-openai-current-deliver MidSessionKeepsHistory -deadlock
 MCPromptCache p6-mutant-note-not-saved MidSessionKeepsHistory -deadlock
+MCPromptCache p6-implicit-proposed - -deadlock
+MCPromptCache p6-implicit-current-deliver MidSessionKeepsHistory -deadlock
 EOT

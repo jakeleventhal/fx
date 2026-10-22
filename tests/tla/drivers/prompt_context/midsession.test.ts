@@ -21,7 +21,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { artifacts, binary, targetHelpers } from "../lib/context";
-import { MID_PROPERTIES, checkRuntime, observe, simulate, timelineMarkdown, type Family, type RuntimeResult } from "./bridge";
+import { MID_PROPERTIES, checkRuntime, observe, simulate, timelineMarkdown, type Design, type Family, type RuntimeResult } from "./bridge";
 import { activityLogger, collectMidSession, type CapturedRequest } from "./scenarios";
 
 const helpers = await targetHelpers();
@@ -54,7 +54,9 @@ function explain(result: RuntimeResult, notes: boolean): string {
     `coverage: ${JSON.stringify(result.coverage)}\nproperties: ${JSON.stringify(result.properties)}`;
 }
 
-async function midSessionVerdicts(model: string) {
+// Design "proposed" is a family fx sends cache markers to; "current" one it
+// sends none to, whose provider caches prefixes by itself (PromptCache.tla).
+async function midSessionVerdicts(model: string, design: Design) {
   const dir = join(artifacts, "midsession", model.replace(/[^a-z0-9]+/gi, "-"));
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   log("midsession_start", { binary, model, artifacts: dir });
@@ -73,7 +75,7 @@ async function midSessionVerdicts(model: string) {
   log("midsession_observed", { model, requests: observed.length, abstraction_errors: errors });
   assert.deepEqual(errors, [], "every request must match a modeled layout");
   const [today, notes] = await Promise.all([false, true].map((n) =>
-    checkRuntime(observed, "proposed", family, join(dir, "tlc"), { notes: n, properties: MID_PROPERTIES })));
+    checkRuntime(observed, design, family, join(dir, "tlc"), { notes: n, properties: MID_PROPERTIES })));
   for (const [n, result] of [[false, today], [true, notes]] as const) {
     writeFileSync(join(dir, `${n ? "notes" : "today"}-layout.json`), JSON.stringify(result, null, 2), { mode: 0o600 });
     log("midsession_checked", { model, notes: n, verdict: result.verdict, detail: result.detail, properties: result.properties });
@@ -81,8 +83,8 @@ async function midSessionVerdicts(model: string) {
   return { today: today!, notes: notes! };
 }
 
-async function expectNotesDesign(model: string) {
-  const { today, notes } = await midSessionVerdicts(model);
+async function expectNotesDesign(model: string, design: Design = "proposed") {
+  const { today, notes } = await midSessionVerdicts(model, design);
   const accepted = [today, notes].filter((r) => r.verdict === "ACCEPTED");
   const both = `${explain(today, false)}\n${explain(notes, true)}\nartifacts: ${artifacts}`;
   assert.equal(accepted.length, 1, `${model}: expected exactly one layout to match\n${both}`);
@@ -96,4 +98,8 @@ test.skipIf(!NEXT_NOTES)("with an Anthropic model, mid-session changes keep the 
 
 test.skipIf(!NEXT_NOTES)("with GPT-5.6 or later, mid-session changes keep the cached conversation", async () => {
   await expectNotesDesign("openai/gpt-6.1-sol");
+}, TIMEOUT);
+
+test.skipIf(!NEXT_NOTES)("with fx's default model, which gets no cache markers, mid-session changes keep the cached conversation", async () => {
+  await expectNotesDesign("spacexai/grok-4.7", "current");
 }, TIMEOUT);

@@ -1634,10 +1634,14 @@ rewriting a cached prompt prefix):
     `keep_steering`: the notes the cut covers follow from those. The
     summarizer reads no notes.
   - **Who gets them:** only the Gateway sends notes, and only to the
-    families it sends cache markers to: Anthropic models, and OpenAI
-    GPT-5.6 and later. A request to any other model or provider leaves the
-    notes out, and the trace log says how many and why. ACP clients never
-    see them replayed.
+    families whose provider took one in live probes and kept the
+    conversation before it cached: Anthropic, OpenAI GPT-5 and later, Grok,
+    GLM, Kimi, Gemini, DeepSeek and MiniMax
+    (`src/gateway/vercel_model_policy.zig` takesContextNotes). Qwen's
+    template rejects a second system message, and untested families keep
+    rules in the instructions. A request to any other model or provider
+    leaves the notes out, and the trace log says how many and why. ACP
+    clients never see them replayed.
 
   **Why:** text that changes during a session, added to the instructions,
   rewrites the cached prefix of every request after it. A note after the

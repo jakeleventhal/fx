@@ -470,8 +470,10 @@ test "agent requests carry context notes only to the families that take them, wi
     for ([_]struct { model: []const u8, takes: bool }{
         .{ .model = "anthropic/claude-sonnet-5.5", .takes = true },
         .{ .model = "openai/gpt-6.1-sol", .takes = true },
-        .{ .model = "openai/gpt-5", .takes = false },
-        .{ .model = "google/gemini-3-flash", .takes = false },
+        .{ .model = "openai/gpt-5", .takes = true },
+        .{ .model = "google/gemini-3-flash", .takes = true },
+        .{ .model = "alibaba/qwen3.8-max", .takes = false },
+        .{ .model = "meta/llama-4-maverick", .takes = false },
     }) |case| {
         const sent = try agent_stream_provider.contextNoteMessages(arena, case.model, &messages);
         try std.testing.expectEqual(case.takes, sent.ptr == (&messages).ptr);
@@ -490,8 +492,10 @@ test "agent requests carry context notes only to the families that take them, wi
         try std.testing.expectEqual(case.takes, std.mem.find(u8, body, note_json) != null);
         try std.testing.expectEqual(case.takes, std.mem.find(u8, body, "scoped rules") != null);
         if (case.takes) try std.testing.expect(std.mem.find(u8, body, "question").? < std.mem.find(u8, body, note_json).?);
-        // Only the stable instructions carry a marker.
-        try std.testing.expectEqual(@as(usize, if (case.takes) 1 else 0), std.mem.count(u8, body, "\"cacheControl\"") + std.mem.count(u8, body, "\"promptCacheBreakpoint\""));
+        // Only the stable instructions carry a marker, for the families fx
+        // marks; a note never does.
+        const markers: usize = @intFromBool(vercel_model_policy.cacheMarkers(case.model) != .none);
+        try std.testing.expectEqual(markers, std.mem.count(u8, body, "\"cacheControl\"") + std.mem.count(u8, body, "\"promptCacheBreakpoint\""));
     }
     // A provider that does not say it takes notes never gets one.
     const other: agent_stream_provider_contract.Provider = .{ .stream_fn = agent_stream_provider.stream_fn };

@@ -2841,7 +2841,7 @@ test "on a route that takes context notes, rules a tool call reaches follow its 
     plain_hooks.context_enabled = true;
     plain_hooks.context_registry = registry;
     var plain_job = fixture.job();
-    plain_job.model = @constCast("openai/gpt-5");
+    plain_job.model = @constCast("meta/llama-4-maverick");
     plain_job.permission_mode = .auto;
     try runFakePrompt(&plain_gateway, &plain_hooks, fixture.config(), plain_job);
     try std.testing.expectEqual(@as(usize, 2), plain_gateway.request_bodies.items.len);
@@ -3347,7 +3347,7 @@ test "retained project context cancellation preserves an interrupted turn" {
     var fixture = PromptFixture{ .workspace_root = workspace };
     var job = fixture.job();
     // Rebuilding rules from saved tool calls is for routes without notes (D93).
-    job.model = @constCast("openai/gpt-5");
+    job.model = @constCast("meta/llama-4-maverick");
     job.history = @constCast(&history);
     ApplicableContextDelta.reset("", &fixture.cancel_flag);
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
@@ -3396,7 +3396,7 @@ test "retained project context refreshes queued rules before a repeated shell ca
     // Rebuilding rules from saved tool calls is for routes without context
     // notes; a route with notes keeps them in its saved notes (D93).
     var first_job = fixture.job();
-    first_job.model = @constCast("openai/gpt-5");
+    first_job.model = @constCast("meta/llama-4-maverick");
     try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), first_job);
     try std.testing.expectEqual(@as(usize, 0), first_hooks.executed_names.items.len);
     try expectBodyContains(&first_gateway, 1, types.context_deferred_tool_result_output);
