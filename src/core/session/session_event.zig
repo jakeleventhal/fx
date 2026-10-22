@@ -48,6 +48,13 @@ pub const ConversationText = struct {
     text: []const u8,
 };
 
+/// A context note's item data (D93): its text and the absolute paths of the
+/// instruction files it delivered.
+pub const ConversationContextNote = struct {
+    text: []const u8,
+    sources: []const types.ContextNoteSource = &.{},
+};
+
 pub const ConversationAssistant = struct {
     text: []const u8,
     provider_replay: ?types.ProviderReplay = null,
@@ -186,6 +193,9 @@ pub const ConversationEvent = union(enum) {
     turn_completed: ConversationTurnCompleted,
     interrupted: ConversationInterruption,
     context_checkpoint: ConversationCheckpoint,
+    /// A system note fx added at a step boundary. Only a v2 session saves
+    /// one, as its `context_note` item (D93).
+    context_note: ConversationContextNote,
 };
 
 pub const ConversationEnvelope = struct {
@@ -264,6 +274,9 @@ pub fn validateConversationTransition(
             return error.UnresolvedToolCall;
         },
         .user, .assistant, .steering, .interrupted => {},
+        // This checks a v1 log, which never holds a context note; only a v2
+        // session saves one (D93).
+        .context_note => return rejectInvalidConversationEvent("context-note-v1"),
     }
 }
 
@@ -303,6 +316,12 @@ pub fn validateConversationEventShape(event: ConversationEvent, schema_version: 
             }
         },
         .steering => |value| try validateConversationText(value.text),
+        .context_note => |value| {
+            try validateConversationText(value.text);
+            for (value.sources) |source| {
+                if (source.path.len == 0) return rejectInvalidConversationEvent("context-note-source");
+            }
+        },
         .tool_call => |call| {
             try validateConversationIdentity(call.call_id);
             try validateConversationIdentity(call.tool_name);
@@ -496,6 +515,9 @@ pub fn decodeConversationFrameLeaky(
     }
     validateConversationEventShape(value.event, value.schema_version) catch
         return error.InvalidConversationFrame;
+    // Every caller reads a v1 log, which never holds a context note; only a
+    // v2 session saves one (D93).
+    if (value.event == .context_note) return error.InvalidConversationFrame;
     return value;
 }
 
@@ -596,6 +618,8 @@ pub fn appendExecutionConversationEvents(
     events: *std.ArrayList(ConversationEvent),
     execution: types.ExecutionMemory,
 ) !void {
+    var note_index: usize = 0;
+    try appendContextNoteConversationEvents(alloc, events, execution.context_notes, &note_index, 0);
     var steering_index: usize = 0;
     while (steering_index < execution.steering.len and
         execution.steering[steering_index].after_tool_step_count == 0)
@@ -658,6 +682,7 @@ pub fn appendExecutionConversationEvents(
             } });
         }
         const completed_steps = step_index + 1;
+        try appendContextNoteConversationEvents(alloc, events, execution.context_notes, &note_index, completed_steps);
         while (steering_index < execution.steering.len and
             execution.steering[steering_index].after_tool_step_count == completed_steps)
         {
@@ -667,6 +692,25 @@ pub fn appendExecutionConversationEvents(
     }
     if (steering_index != execution.steering.len) {
         return rejectInvalidConversationEvent("steering-boundary");
+    }
+    if (note_index != execution.context_notes.len) {
+        return rejectInvalidConversationEvent("context-note-boundary");
+    }
+}
+
+/// The notes at the boundary after `completed_steps` steps, which come
+/// before that boundary's steering (D93). Advances `index` past them.
+fn appendContextNoteConversationEvents(
+    alloc: Allocator,
+    events: *std.ArrayList(ConversationEvent),
+    notes: []const types.PersistedContextNote,
+    index: *usize,
+    completed_steps: usize,
+) !void {
+    while (index.* < notes.len and notes[index.*].after_tool_step_count == completed_steps) : (index.* += 1) {
+        // Like empty steering, an empty note is not saved.
+        const note = notes[index.*];
+        if (note.text.len > 0) try events.append(alloc, .{ .context_note = .{ .text = note.text, .sources = note.sources } });
     }
 }
 

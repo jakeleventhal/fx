@@ -2723,6 +2723,138 @@ test "modern directory glob executes while nested project instructions load" {
     );
 }
 
+/// The leading system messages of a Gateway request body: the instructions.
+fn leadingSystemContents(alloc: std.mem.Allocator, body: []const u8) !std.ArrayList([]const u8) {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, body, .{});
+    var contents: std.ArrayList([]const u8) = .empty;
+    for (parsed.object.get("prompt").?.array.items) |message| {
+        if (!std.mem.eql(u8, message.object.get("role").?.string, "system")) break;
+        try contents.append(alloc, message.object.get("content").?.string);
+    }
+    return contents;
+}
+
+fn expectSameInstructions(alloc: std.mem.Allocator, a: []const u8, b: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const first = try leadingSystemContents(arena_state.allocator(), a);
+    const second = try leadingSystemContents(arena_state.allocator(), b);
+    try std.testing.expectEqual(first.items.len, second.items.len);
+    for (first.items, second.items) |x, y| try std.testing.expectEqualStrings(x, y);
+}
+
+/// The request ends with a tool result and then a system note holding `rule`.
+fn expectNoteAfterResults(alloc: std.mem.Allocator, body: []const u8, rule: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
+    const prompt = parsed.object.get("prompt").?.array.items;
+    try std.testing.expect(prompt.len >= 2);
+    const note = prompt[prompt.len - 1].object;
+    try std.testing.expectEqualStrings("system", note.get("role").?.string);
+    try std.testing.expect(std.mem.find(u8, note.get("content").?.string, rule) != null);
+    try std.testing.expectEqualStrings("tool", prompt[prompt.len - 2].object.get("role").?.string);
+}
+
+test "on a route that takes context notes, rules a tool call reaches follow its results and stay out of the instructions (D93)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/nested");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/AGENTS.md", .data = "NOTE_SCOPE_RULE" });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const rules_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "nested", "AGENTS.md" });
+    defer alloc.free(rules_path);
+    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
+    const calls = [_]ToolCall{toolCall("note_glob", "glob_files", "{\"pattern\":\"*\",\"path\":\"nested\"}")};
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Final" } };
+    var fixture = PromptFixture{ .workspace_root = workspace };
+
+    // Turn 1: the rules follow the step's results as a note; the
+    // instructions stay as the first request sent them.
+    var first_gateway = FakeGateway.init(alloc, &completions);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.context_enabled = true;
+    first_hooks.context_registry = registry;
+    var job = fixture.job();
+    job.model = @constCast("anthropic/claude-sonnet-5.5");
+    job.permission_mode = .auto;
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 2), first_gateway.request_bodies.items.len);
+    try expectBodyNotContains(&first_gateway, 0, "NOTE_SCOPE_RULE");
+    try expectNoteAfterResults(alloc, first_gateway.request_bodies.items[1], "NOTE_SCOPE_RULE");
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], first_gateway.request_bodies.items[1]);
+    // The saved turn keeps the note at its boundary, with the file it delivered.
+    try std.testing.expectEqual(@as(usize, 1), first_hooks.history_turns.items.len);
+    const saved = first_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes[0].sources.len);
+    try std.testing.expectEqualStrings(rules_path, saved.context_notes[0].sources[0].path);
+    try std.testing.expect(saved.context_notes[0].sources[0].stamp != 0);
+
+    // Turn 2: the instructions do not rebuild the rules from the saved call,
+    // and a call that reaches the folder again does not deliver them again.
+    var second_gateway = FakeGateway.init(alloc, &completions);
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    second_hooks.context_enabled = true;
+    second_hooks.context_registry = registry;
+    job.history = first_hooks.history_turns.items;
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 2), second_gateway.request_bodies.items.len);
+    for (second_gateway.request_bodies.items) |body| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "NOTE_SCOPE_RULE"));
+    }
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], second_gateway.request_bodies.items[0]);
+
+    // Turn 3: after the file changes, the next call that reaches it delivers
+    // the current rules in a new note that replaces the earlier copy.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/AGENTS.md", .data = "NOTE_SCOPE_RULE_EDITED" });
+    var both_turns: std.ArrayList(types.HistoryTurn) = .empty;
+    defer both_turns.deinit(alloc);
+    try both_turns.appendSlice(alloc, first_hooks.history_turns.items);
+    try both_turns.appendSlice(alloc, second_hooks.history_turns.items);
+    var third_gateway = FakeGateway.init(alloc, &completions);
+    defer third_gateway.deinit();
+    var third_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer third_hooks.deinit();
+    third_hooks.context_enabled = true;
+    third_hooks.context_registry = registry;
+    job.history = both_turns.items;
+    try runFakePrompt(&third_gateway, &third_hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 2), third_gateway.request_bodies.items.len);
+    try expectBodyNotContains(&third_gateway, 0, "NOTE_SCOPE_RULE_EDITED");
+    try expectNoteAfterResults(alloc, third_gateway.request_bodies.items[1], "NOTE_SCOPE_RULE_EDITED");
+    try expectNoteAfterResults(alloc, third_gateway.request_bodies.items[1], "The rules below replace the earlier copy from the same file.");
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], third_gateway.request_bodies.items[1]);
+
+    // A route that takes no notes still adds the rules to the instructions.
+    var plain_gateway = FakeGateway.init(alloc, &completions);
+    defer plain_gateway.deinit();
+    var plain_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer plain_hooks.deinit();
+    plain_hooks.context_enabled = true;
+    plain_hooks.context_registry = registry;
+    var plain_job = fixture.job();
+    plain_job.model = @constCast("openai/gpt-5");
+    plain_job.permission_mode = .auto;
+    try runFakePrompt(&plain_gateway, &plain_hooks, fixture.config(), plain_job);
+    try std.testing.expectEqual(@as(usize, 2), plain_gateway.request_bodies.items.len);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const instructions = try leadingSystemContents(arena_state.allocator(), plain_gateway.request_bodies.items[1]);
+    const in_instructions = for (instructions.items) |content| {
+        if (std.mem.find(u8, content, "NOTE_SCOPE_RULE") != null) break true;
+    } else false;
+    try std.testing.expect(in_instructions);
+    try std.testing.expectEqual(@as(usize, 0), plain_hooks.history_turns.items[0].assistant.execution.context_notes.len);
+}
+
 test "modern parallel preparation validates and checks availability once" {
     const alloc = std.testing.allocator;
     defer EmptyApplicableContext.reset();
@@ -3214,6 +3346,8 @@ test "retained project context cancellation preserves an interrupted turn" {
     hooks.context_registry = ApplicableContextDelta.registry;
     var fixture = PromptFixture{ .workspace_root = workspace };
     var job = fixture.job();
+    // Rebuilding rules from saved tool calls is for routes without notes (D93).
+    job.model = @constCast("openai/gpt-5");
     job.history = @constCast(&history);
     ApplicableContextDelta.reset("", &fixture.cancel_flag);
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
@@ -3259,7 +3393,11 @@ test "retained project context refreshes queued rules before a repeated shell ca
     first_hooks.context_enabled = true;
     first_hooks.context_registry = registry;
     var fixture = PromptFixture{ .workspace_root = workspace };
-    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), fixture.job());
+    // Rebuilding rules from saved tool calls is for routes without context
+    // notes; a route with notes keeps them in its saved notes (D93).
+    var first_job = fixture.job();
+    first_job.model = @constCast("openai/gpt-5");
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), first_job);
     try std.testing.expectEqual(@as(usize, 0), first_hooks.executed_names.items.len);
     try expectBodyContains(&first_gateway, 1, types.context_deferred_tool_result_output);
 
@@ -3269,7 +3407,7 @@ test "retained project context refreshes queued rules before a repeated shell ca
     });
     defer queued_snapshot.deinit(alloc);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/AGENTS.md", .data = "RETAINED_CURRENT_RULE" });
-    var job = fixture.job();
+    var job = first_job;
     job.history = first_hooks.history_turns.items;
     job.context_snapshot = queued_snapshot;
     var second_gateway = FakeGateway.init(alloc, &completions);

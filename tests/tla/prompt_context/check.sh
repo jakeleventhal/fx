@@ -45,4 +45,13 @@ MCPromptCache openai-current-context ContextChangeKeepsStable -deadlock
 MCPromptCache openai-mutant-every-system Budget -deadlock
 MCPromptCache openai-mutant-fence-after-context SameWorktreeReuse -deadlock
 MCPromptCache openai-mutant-explicit-only SessionReuse -deadlock
+MCPromptCache p6-proposed - -deadlock
+MCPromptCache p6-proposed-sessions - -deadlock
+MCPromptCache p6-openai-proposed - -deadlock
+MCPromptCache p6-openai-proposed-sessions - -deadlock
+MCPromptCache p6-current-switch MidSessionKeepsHistory -deadlock
+MCPromptCache p6-current-deliver MidSessionKeepsHistory -deadlock
+MCPromptCache p6-current-skill MidSessionKeepsHistory -deadlock
+MCPromptCache p6-openai-current-deliver MidSessionKeepsHistory -deadlock
+MCPromptCache p6-mutant-note-not-saved MidSessionKeepsHistory -deadlock
 EOT

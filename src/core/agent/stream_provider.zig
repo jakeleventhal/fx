@@ -234,14 +234,127 @@ pub fn validate_prompt_lanes(
             instruction.provider_replay != null or
             instruction.tool_result_status != null or
             instruction.tool_result_memory != null or
-            instruction.permission_feedback)
+            instruction.permission_feedback or
+            instruction.context_note)
         {
             return error.InvalidProviderPrompt;
         }
     }
     for (messages) |message| {
-        if (message.role == .system) return error.InvalidProviderPrompt;
+        // The messages lane carries a system message only as a context note,
+        // which is plain text and nothing else (D93).
+        if (message.context_note and (message.role != .system or
+            message.content == null or
+            message.images.len != 0 or
+            message.tool_call_id != null or
+            message.tool_name != null or
+            message.tool_calls.len != 0 or
+            message.provider_replay != null or
+            message.tool_result_status != null or
+            message.tool_result_memory != null or
+            message.permission_feedback or
+            message.cache_breakpoint))
+        {
+            return error.InvalidProviderPrompt;
+        }
+        if (message.role == .system and !message.context_note) return error.InvalidProviderPrompt;
     }
+}
+
+/// Moves each run of context notes past the user messages that directly
+/// follow it, so a note is the last message or comes right before an
+/// assistant message. Claude reads the conversation differently from the
+/// instructions on when a system message comes right before a user message,
+/// so a note that later gained a user message after it, such as steering, the
+/// resumed turn's file evidence, or the next prompt, would miss the cache for
+/// the whole conversation (D93). The saved order is unchanged; only the sent
+/// order moves, the same way for a live and a resumed turn. Returns
+/// `messages` when no note moves, otherwise a copy in `arena`.
+fn placeContextNotes(arena: Allocator, messages: []const types.ChatMessage) Allocator.Error![]const types.ChatMessage {
+    const moves = for (messages, 0..) |message, index| {
+        if (message.context_note and index + 1 < messages.len and messages[index + 1].role == .user) break true;
+    } else false;
+    if (!moves) return messages;
+    const placed = try arena.alloc(types.ChatMessage, messages.len);
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < messages.len) {
+        if (!messages[index].context_note) {
+            placed[count] = messages[index];
+            count += 1;
+            index += 1;
+            continue;
+        }
+        var notes_end = index;
+        while (notes_end < messages.len and messages[notes_end].context_note) notes_end += 1;
+        var users_end = notes_end;
+        while (users_end < messages.len and messages[users_end].role == .user) users_end += 1;
+        @memcpy(placed[count..][0 .. users_end - notes_end], messages[notes_end..users_end]);
+        count += users_end - notes_end;
+        @memcpy(placed[count..][0 .. notes_end - index], messages[index..notes_end]);
+        count += notes_end - index;
+        index = users_end;
+    }
+    std.debug.assert(count == messages.len);
+    return placed;
+}
+
+test "a context note never comes right before a user message (D93)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Case = struct { in: []const types.ChatMessage, out: []const []const u8 };
+    const user = types.ChatMessage{ .role = .user, .content = "user" };
+    const steer = types.ChatMessage{ .role = .user, .content = "steer" };
+    const answer = types.ChatMessage{ .role = .assistant, .content = "answer" };
+    const result = types.ChatMessage{ .role = .tool, .content = "result", .tool_call_id = "c" };
+    const note = types.ChatMessage{ .role = .system, .content = "note", .context_note = true };
+    const second = types.ChatMessage{ .role = .system, .content = "second", .context_note = true };
+    for ([_]Case{
+        // Steering after a step's note: the note goes after it.
+        .{ .in = &.{ user, answer, result, note, steer }, .out = &.{ "user", "answer", "result", "steer", "note" } },
+        // A resumed turn: the note moves past every user message after it.
+        .{ .in = &.{ user, answer, result, note, steer, user, answer }, .out = &.{ "user", "answer", "result", "steer", "user", "note", "answer" } },
+        // Notes in a row move together and keep their order.
+        .{ .in = &.{ user, note, second, steer }, .out = &.{ "user", "steer", "note", "second" } },
+    }) |case| {
+        const placed = try placeContextNotes(arena, case.in);
+        try std.testing.expect(placed.ptr != case.in.ptr);
+        try std.testing.expectEqual(case.out.len, placed.len);
+        for (case.out, placed) |want, got| try std.testing.expectEqualStrings(want, got.content.?);
+    }
+    // A note that is last or comes before an assistant message stays put,
+    // and the caller's messages come back as they are.
+    for ([_][]const types.ChatMessage{
+        &.{ user, answer, result, note },
+        &.{ user, note, answer },
+        &.{ user, answer },
+    }) |messages| {
+        try std.testing.expect((try placeContextNotes(arena, messages)).ptr == messages.ptr);
+    }
+}
+
+test "the messages lane takes a system message only as a context note" {
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "rules" }};
+    try validate_prompt_lanes(&instructions, &.{
+        .{ .role = .user, .content = "question" },
+        .{ .role = .system, .content = "scoped rules", .context_note = true },
+    });
+    for ([_]types.ChatMessage{
+        .{ .role = .system, .content = "late instruction" },
+        .{ .role = .system, .context_note = true },
+        .{ .role = .user, .content = "not a note", .context_note = true },
+        .{ .role = .system, .content = "marked", .context_note = true, .cache_breakpoint = true },
+    }) |message| {
+        try std.testing.expectError(error.InvalidProviderPrompt, validate_prompt_lanes(&instructions, &.{
+            .{ .role = .user, .content = "question" },
+            message,
+        }));
+    }
+    // A note never joins the instructions lane.
+    try std.testing.expectError(error.InvalidProviderPrompt, validate_prompt_lanes(&.{
+        .{ .role = .system, .content = "note", .context_note = true },
+    }, &.{.{ .role = .user, .content = "question" }}));
 }
 
 /// Borrowed typed request. Providers own validation, wire serialization,
@@ -513,6 +626,36 @@ pub const Provider = struct {
     /// The largest request body this provider's transport can carry, when it
     /// has its own limit below any provider's.
     max_request_bytes: ?usize = null,
+    /// Whether this provider sends `model` context notes, system messages
+    /// after the conversation starts (D93). Null means it never does.
+    takes_context_notes_fn: ?*const fn (model: []const u8) bool = null,
+
+    /// `messages` as this provider sends them to `model`: without context
+    /// notes when it does not take them, and otherwise with each note placed
+    /// by `placeContextNotes`. Returns `messages` itself when nothing changes,
+    /// otherwise a copy in `arena`. The agent runtime applies it once to each
+    /// request before anything measures, observes, or sends it, so all of
+    /// those see the same messages.
+    pub fn contextNoteMessages(
+        self: Provider,
+        arena: Allocator,
+        model: []const u8,
+        messages: []const types.ChatMessage,
+    ) Allocator.Error![]const types.ChatMessage {
+        var notes: usize = 0;
+        for (messages) |message| notes += @intFromBool(message.context_note);
+        if (notes == 0) return messages;
+        if (self.takes_context_notes_fn) |takes| if (takes(model)) return placeContextNotes(arena, messages);
+        const kept = try arena.alloc(types.ChatMessage, messages.len - notes);
+        var index: usize = 0;
+        for (messages) |message| {
+            if (message.context_note) continue;
+            kept[index] = message;
+            index += 1;
+        }
+        debug_trace.logf("agent", "context_notes_dropped count={d} model={s} reason=provider_takes_no_mid_conversation_system", .{ notes, model });
+        return kept;
+    }
 
     /// Borrows unchanged payloads; projected payloads live in the caller's arena.
     pub fn projectReplay(self: Provider, arena: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {

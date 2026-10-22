@@ -333,7 +333,8 @@ fn buildGatewayRequestBodyValidated(
     var saw_conversation = false;
     for (messages) |message| {
         if (message.role == .system) {
-            if (saw_conversation) return error.InvalidGatewayHistory;
+            // Only a context note follows the conversation's start (D93).
+            if (saw_conversation and !message.context_note) return error.InvalidGatewayHistory;
         } else {
             saw_conversation = true;
         }
@@ -370,8 +371,9 @@ fn buildGatewayRequestBodyValidated(
             verified_images,
             &ids,
             // A marker belongs only to a request that asks the Gateway to
-            // cache; helpers on provider defaults send none.
-            if (options.prompt_caching) options.cache_markers else .none,
+            // cache; helpers on provider defaults send none. A context note
+            // never carries one.
+            if (options.prompt_caching and !message.context_note) options.cache_markers else .none,
         );
         if (budget) |active| try active.check();
         i += 1;

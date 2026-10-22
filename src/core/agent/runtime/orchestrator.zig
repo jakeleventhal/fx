@@ -2674,6 +2674,125 @@ pub const TestHooks = if (builtin.is_test) struct {
     pub var context_gate_commit: ?*const fn () Allocator.Error!void = null;
 } else struct {};
 
+/// Whether the route for `model` takes context notes (D93). Rules a tool call
+/// reaches then follow the conversation instead of joining the stable
+/// instructions, so the cached conversation stays as it was.
+fn routeTakesContextNotes(deps: *const AgentRuntimeDeps, model: []const u8) bool {
+    const takes = deps.agent_stream_provider.takes_context_notes_fn orelse return false;
+    return takes(model);
+}
+
+/// A stamp of an instruction file's size, modification time, and inode, so a
+/// later turn can tell whether the file changed since a note delivered it.
+/// Never 0; returns 0 when the file cannot be read (D93).
+fn noteSourceStamp(path: []const u8) u64 {
+    const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch return 0;
+    var hasher = std.hash.Wyhash.init(0);
+    const fields = [_]u64{
+        stat.size,
+        @bitCast(@as(i64, @truncate(stat.mtime.nanoseconds))),
+        @intCast(stat.inode),
+    };
+    hasher.update(std.mem.sliceAsBytes(&fields));
+    // 53 bits stay exact for any JSON reader of the saved session.
+    return (hasher.final() & ((@as(u64, 1) << 53) - 1)) | 1;
+}
+
+const replaced_rules_preface = "The rules below replace the earlier copy from the same file.\n\n";
+
+/// The notes design's commit (D93): records the delivery and queues the
+/// selected rules as a context note, which joins the turn after this step's
+/// results. Takes `selected.content`. The note keeps each delivered file with
+/// its stamp, so a later turn counts an unchanged file as delivered. When a
+/// file changed since an earlier note, the note says it replaces that copy.
+fn commitContextNote(
+    arena: Allocator,
+    pending_notes: *std.ArrayList(ChatMessage),
+    context_delivery_state: *context_contract.DeliveryState,
+    selected: *context_contract.ProviderContext,
+    replaced_sources: []const []const u8,
+) Allocator.Error!void {
+    if (comptime builtin.is_test) {
+        if (TestHooks.context_gate_commit) |hook| try hook();
+    }
+    const content = selected.content orelse return context_delivery_state.commit(arena, selected);
+    const sources = try arena.alloc(types.ContextNoteSource, selected.delivered_sources.len);
+    var replaces = false;
+    for (selected.delivered_sources, sources) |source, *dest| {
+        dest.* = .{ .path = try arena.dupe(u8, source), .stamp = noteSourceStamp(source) };
+        if (containsPath(replaced_sources, source)) replaces = true;
+    }
+    const text = if (replaces) try std.mem.concat(arena, u8, &.{ replaced_rules_preface, content }) else content;
+    try pending_notes.ensureUnusedCapacity(arena, 1);
+    try context_delivery_state.commit(arena, selected);
+    pending_notes.appendAssumeCapacity(.{
+        .role = .system,
+        .content = text,
+        .context_note = true,
+        .context_note_sources = sources,
+    });
+    selected.content = null;
+}
+
+fn containsPath(paths: []const []const u8, path: []const u8) bool {
+    for (paths) |candidate| {
+        if (std.mem.eql(u8, candidate, path)) return true;
+    }
+    return false;
+}
+
+/// Counts each instruction file a saved note delivered as delivered when the
+/// file has not changed since, so the gate does not deliver it again (D93).
+/// A changed or missing file goes to `replaced` instead, and the next tool
+/// call that reaches it delivers its current rules in a new note. A note a
+/// compaction dropped is not counted either.
+fn seedNoteDeliveredSources(
+    arena: Allocator,
+    state: *context_contract.DeliveryState,
+    replaced: *std.ArrayList([]const u8),
+    history: []const types.HistoryTurn,
+    recovery: ?types.ExecutionMemory,
+) Allocator.Error!void {
+    for (history) |turn| {
+        const execution = switch (turn) {
+            .assistant => |entry| entry.execution,
+            .interrupted => |entry| entry.execution,
+            .compacted_summary => continue,
+        };
+        try seedNoteSources(arena, state, replaced, execution.context_notes);
+    }
+    if (recovery) |execution| try seedNoteSources(arena, state, replaced, execution.context_notes);
+}
+
+fn seedNoteSources(
+    arena: Allocator,
+    state: *context_contract.DeliveryState,
+    replaced: *std.ArrayList([]const u8),
+    notes: []const types.PersistedContextNote,
+) Allocator.Error!void {
+    for (notes) |note| for (note.sources) |source| {
+        const current = noteSourceStamp(source.path);
+        if (source.stamp != 0 and source.stamp == current) {
+            // A later note delivered this file again after it changed.
+            for (replaced.items, 0..) |path, i| {
+                if (std.mem.eql(u8, path, source.path)) {
+                    _ = replaced.orderedRemove(i);
+                    break;
+                }
+            }
+            if (!containsPath(state.delivered_sources.items, source.path)) {
+                try state.delivered_sources.append(arena, try arena.dupe(u8, source.path));
+            }
+            continue;
+        }
+        debug_trace.logf("context", "context note source not counted as delivered reason={s} path={s}", .{
+            if (current == 0) "missing" else "changed",
+            source.path,
+        });
+        if (!containsPath(replaced.items, source.path)) try replaced.append(arena, try arena.dupe(u8, source.path));
+    };
+}
+
 fn commitSelectedContext(
     arena: Allocator,
     stable_prefix: *std.ArrayList(ChatMessage),
@@ -6182,6 +6301,10 @@ fn reconstructProjectContext(
     job: QueuedPrompt,
 ) !?context_contract.GatheredContextSnapshot {
     if (!deps.context_enabled) return null;
+    // On a route that takes notes, rules earlier tool calls reached are in the
+    // saved notes, so the stable instructions keep the session-start rules
+    // and do not change mid-session (D93).
+    if (routeTakesContextNotes(deps, job.model)) return null;
     var retained = try tool_preparation.retainedContextTargets(
         alloc,
         job.history,
@@ -6836,6 +6959,20 @@ fn processQueuedPromptLoop(
     else
         .{};
     defer context_delivery_state.deinit(arena);
+    const take_context_notes = deps.context_enabled and routeTakesContextNotes(deps, job.model);
+    // Files saved notes delivered that changed since; their current rules
+    // are delivered again when a tool call reaches them.
+    var replaced_note_sources: std.ArrayList([]const u8) = .empty;
+    if (take_context_notes) try seedNoteDeliveredSources(
+        arena,
+        &context_delivery_state,
+        &replaced_note_sources,
+        job.history,
+        if (job.recovery_checkpoint) |checkpoint| checkpoint.execution else null,
+    );
+    // Notes the gate queued during a step; they join the turn at the next
+    // step boundary.
+    var pending_context_notes: std.ArrayList(ChatMessage) = .empty;
     const root_user_intent_context = switch (config.origin) {
         .subagent => if (config.current_prompt_is_root_authority)
             try auto_classifier_context.buildRootUserContextFromVerifiedRequests(
@@ -6979,6 +7116,12 @@ fn processQueuedPromptLoop(
     var restore_recovery_source = job.recovery_checkpoint != null;
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
+        // The notes the last step's gate queued follow that step's results and
+        // come before any steering at this boundary (D93).
+        if (pending_context_notes.items.len > 0) {
+            try within_turn_suffix.appendSlice(arena, pending_context_notes.items);
+            pending_context_notes.clearRetainingCapacity();
+        }
         current_step_index = step + 1;
         if (deps.observer) |observer| observer.beginStep(current_step_index);
         defer if (deps.observer) |observer| observer.endStep();
@@ -7395,9 +7538,12 @@ fn processQueuedPromptLoop(
             // After the steering rewrap, which recognizes a parent's steering
             // by how its text starts.
             const located_messages = try image_attachments.noteAttachmentLocations(overlay_arena, steering_messages);
-            const request_messages = try with_replyable_conversation_tail(overlay_arena, located_messages);
-            if (request_messages.ptr != located_messages.ptr) {
-                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{located_messages.len});
+            // The one place a request loses the context notes its route does
+            // not take, before anything measures, observes, or sends it (D93).
+            const noted_messages = try deps.agent_stream_provider.contextNoteMessages(overlay_arena, gateway_model, located_messages);
+            const request_messages = try with_replyable_conversation_tail(overlay_arena, noted_messages);
+            if (request_messages.ptr != noted_messages.ptr) {
+                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{noted_messages.len});
             }
             // Images withheld because the catalog could not confirm image
             // input are invisible in the transcript otherwise. The core asks
@@ -10049,12 +10195,10 @@ fn processQueuedPromptLoop(
                 return;
             }
 
-            commitSelectedContext(
-                arena,
-                &stable_prefix,
-                &context_delivery_state,
-                &selected,
-            ) catch |err| {
+            (if (take_context_notes)
+                commitContextNote(arena, &pending_context_notes, &context_delivery_state, &selected, replaced_note_sources.items)
+            else
+                commitSelectedContext(arena, &stable_prefix, &context_delivery_state, &selected)) catch |err| {
                 return settleFailedContextGate(
                     deps,
                     &stream_ctx.provisional_statuses,

@@ -53,6 +53,21 @@
 (* repository send the same bytes there. TRUE models absolute paths, fx    *)
 (* before that change; mutant-absolute-paths.cfg keeps it failing.         *)
 (*                                                                         *)
+(* Events lists the mid-session events a behavior may contain: "switch"    *)
+(* (the agent switches branches during a tool step), "deliver" (a tool     *)
+(* step reaches a folder with its own AGENTS.md, so fx delivers its scoped *)
+(* rules) and "skill" (a user turn names a skill). Notes = FALSE is fx     *)
+(* today: delivered rules are appended to the stable instructions for that *)
+(* turn and move into them on the next turn, a named skill sits in the     *)
+(* overlay for its turn only, and a branch switch rewrites the turn        *)
+(* context. Notes = TRUE is the proposed design, which fx does not have    *)
+(* yet: the instructions stay as the session started, each change is a     *)
+(* note after the latest message, and at the end of a skill turn the skill *)
+(* text is swapped for a short note. Mutation "note_not_saved" drops notes *)
+(* at the next user turn, as if they were not saved with the session. On   *)
+(* OpenAI a note is not an eligible message, so it is cached only after    *)
+(* the next one.                                                           *)
+(*                                                                         *)
 (* Abstraction: a block is a [k, v] record; equal v means equal bytes.     *)
 (* Tokens, cache lifetime, eviction and the provider's 20-block lookback   *)
 (* window are not modeled: every modeled request is shorter than the       *)
@@ -69,13 +84,16 @@ CONSTANTS
   MaxSteps,     \* model requests after the first in one session
   Limit,        \* blocks per request that may carry a cache marker
   PathScoped,   \* skill catalog and project rules embed the worktree path
-  Family        \* "anthropic" | "openai": the provider's cache rules
+  Family,       \* "anthropic" | "openai": the provider's cache rules
+  Events,       \* mid-session events: a subset of {"switch", "deliver", "skill"}
+  Notes         \* mid-session changes become notes after the conversation
 
 ASSUME Design \in {"current", "proposed"}
 ASSUME Family \in {"anthropic", "openai"}
-ASSUME Mutation \in {"none", "mark_every_system", "fence_after_context", "no_auto"}
+ASSUME Mutation \in {"none", "mark_every_system", "fence_after_context", "no_auto", "note_not_saved"}
 ASSUME MaxSessions \in Nat /\ MaxSteps \in Nat /\ Limit \in Nat
 ASSUME PathScoped \in BOOLEAN
+ASSUME Events \subseteq {"switch", "deliver", "skill"} /\ Notes \in BOOLEAN
 
 Block(k, v) == [k |-> k, v |-> v]
 
@@ -87,35 +105,47 @@ Block(k, v) == [k |-> k, v |-> v]
 (*   project  AGENTS.md project context, tagged with the file's path       *)
 (*   mcp      MCP catalog                                                  *)
 (*   ctx      <fx-turn-context>: worktree path, date, branch               *)
-(*   rt       permission, verification and response-language notes        *)
+(*   rt       permission, verification and response-language notes         *)
+(*   scoped   rules from a subfolder AGENTS.md, delivered at tool time     *)
+(*   skill    a named skill's text for its turn                            *)
+(*   note     a mid-session change after the conversation (Notes)          *)
 Scoped(w) == IF PathScoped THEN w ELSE RepoOf[w]
 
-Instructions(w, br) ==
+Stable(w) ==
   << Block("tools", "p"), Block("base", "p"), Block("skills", Scoped(w)),
-     Block("project", Scoped(w)), Block("mcp", "p"), Block("ctx", w \o "@" \o br),
-     Block("rt", "p") >>
+     Block("project", Scoped(w)), Block("mcp", "p") >>
+
+Overlay(w, br) == << Block("ctx", w \o "@" \o br), Block("rt", "p") >>
+
+Instructions(w, br) == Stable(w) \o Overlay(w, br)
 
 PosProfile == 2   \* last repo-independent block: base
-PosStable  == 5   \* last stable block: mcp
-PosContext == 6   \* the turn context
-NInstr     == 7
+PosStable  == 5   \* last stable block of a session's first request: mcp
+
+(* Where a block kind sits in req. Every request has one of each           *)
+(* instruction kind, so positions follow today's mid-session insertions.   *)
+PosOf(req, kind) == CHOOSE i \in 1..Len(req) : req[i].k = kind
+NInstr(req) == PosOf(req, "rt")
 
 Max(S) == CHOOSE x \in S : \A y \in S : y <= x
 
 LastUser(req) == Max({i \in 1..Len(req) : req[i].k = "user"})
 
 Manual(req) ==
-  CASE Mutation = "mark_every_system" -> {2, 3, 4, PosStable}
+  CASE Mutation = "mark_every_system" -> {2, 3, 4, PosOf(req, "mcp")}
     [] Design = "current" -> {}
-    [] Mutation = "fence_after_context" -> {PosProfile, PosContext}
-    [] OTHER -> {PosProfile, PosStable}
+    [] Mutation = "fence_after_context" -> {PosProfile, PosOf(req, "ctx")}
+    [] OTHER -> {PosProfile, PosOf(req, "mcp")}
 
-(* The provider's own breakpoints: Gateway caching "auto" for Anthropic,    *)
-(* the implicit breakpoint for OpenAI.                                      *)
+(* OpenAI eligible message endings after the instructions.                 *)
+Eligible(req) == {j \in (NInstr(req) + 1)..Len(req) : req[j].k \in {"user", "asst"}}
+
+(* The provider's own breakpoints: Gateway caching "auto" for Anthropic,   *)
+(* the implicit breakpoint for OpenAI, at the latest eligible message.     *)
 Auto(req) ==
   CASE Mutation = "no_auto" -> {}
     [] Family = "anthropic" -> {Len(req), LastUser(req) - 1}
-    [] OTHER -> {Len(req)}
+    [] OTHER -> {Max(Eligible(req) \cup {NInstr(req)})}
 
 (* Breakpoints of req when its manual markers are man.                     *)
 BpsWith(req, man) == man \cup Auto(req)
@@ -125,11 +155,8 @@ Breakpoints(req) == BpsWith(req, Manual(req))
 (* Positions where req leaves a cache entry.                               *)
 WritesWith(req, man) ==
   IF Family = "openai" /\ Mutation # "no_auto"
-  THEN BpsWith(req, man) \cup {NInstr}
+  THEN BpsWith(req, man) \cup {NInstr(req)}
   ELSE BpsWith(req, man)
-
-(* OpenAI eligible message endings after the instructions.                 *)
-Eligible(req) == {j \in (NInstr + 1)..Len(req) : req[j].k \in {"user", "asst"}}
 
 (* Anthropic: the longest written entry that is a prefix of req and ends at *)
 (* or before one of its breakpoints.                                        *)
@@ -142,7 +169,7 @@ Hit(req, bps, c) ==
 (* candidate of req.                                                        *)
 Candidates(req, man) ==
   IF Mutation = "no_auto" THEN man
-  ELSE BpsWith(req, man) \cup Eligible(req) \cup {NInstr}
+  ELSE BpsWith(req, man) \cup Eligible(req) \cup {NInstr(req)}
 
 Lookup(req, man, c) ==
   LET found == {n \in Candidates(req, man) : SubSeq(req, 1, n) \in c}
@@ -155,8 +182,28 @@ ReadWith(req, man, c) ==
 VARIABLES cache, sessions, active, log, branchOf
 vars == <<cache, sessions, active, log, branchOf>>
 
-NoSession == [on |-> FALSE, w |-> "none", s |-> 0, n |-> 0, br |-> "b1",
-              hist |-> <<>>, last |-> <<>>, switched |-> FALSE]
+NoSession == [on |-> FALSE, w |-> "none", s |-> 0, n |-> 0, br |-> "b1", br0 |-> "b1",
+              hist |-> <<>>, last |-> <<>>, switched |-> FALSE, delivered |-> FALSE,
+              skilled |-> FALSE, scopedTurn |-> FALSE, scopedStable |-> FALSE,
+              skill |-> FALSE, skillUser |-> 0, skillText |-> 0]
+
+(* The instructions of session a's next request. With Notes they stay as   *)
+(* the session started; otherwise they carry today's mid-session           *)
+(* insertions.                                                             *)
+Lead(a) ==
+  IF Notes THEN Instructions(a.w, a.br0)
+  ELSE SubSeq(Stable(a.w), 1, 4)
+         \o (IF a.scopedStable THEN << Block("scoped", Scoped(a.w)) >> ELSE << >>)
+         \o << Block("mcp", "p") >>
+         \o (IF a.scopedTurn THEN << Block("scoped", Scoped(a.w)) >> ELSE << >>)
+         \o (IF a.skill THEN << Block("skill", "k") >> ELSE << >>)
+         \o Overlay(a.w, a.br)
+
+(* The end of prev without the notes after its last message: what the next *)
+(* request must read. A trailing note is cheap, and OpenAI caches it only  *)
+(* after the next eligible message.                                        *)
+LastKept(prev) ==
+  Max({i \in 1..Len(prev) : prev[i].k \notin {"note", "skilltext"}} \cup {0})
 
 Init ==
   /\ cache = {}
@@ -166,12 +213,12 @@ Init ==
   /\ branchOf = [w \in Worktrees |-> "b1"]
 
 (* Send one request and record what the provider read.                     *)
-Send(w, s, br, hist, first, prev, changed) ==
-  LET req == Instructions(w, br) \o hist
-      bps == Breakpoints(req)
+Send(w, s, req, first, prev, changed, keep) ==
+  LET bps == Breakpoints(req)
   IN /\ cache' = cache \cup {SubSeq(req, 1, n) : n \in WritesWith(req, Manual(req))}
      /\ log' = Append(log, [w |-> w, s |-> s, first |-> first, req |-> req, bps |-> bps,
                             read |-> ReadWith(req, Manual(req), cache), prev |-> prev, changed |-> changed,
+                            keep |-> keep,
                             repoSeen |-> \E i \in 1..Len(log) : RepoOf[log[i].w] = RepoOf[w],
                             worktreeSeen |-> \E i \in 1..Len(log) : log[i].w = w,
                             anySeen |-> Len(log) > 0])
@@ -181,29 +228,62 @@ Start(w) ==
   LET s == sessions + 1
       br == branchOf[w]
       hist == << Block("user", ToString(s) \o ".0") >>
+      a == [NoSession EXCEPT !.on = TRUE, !.w = w, !.s = s, !.br = br, !.br0 = br,
+                             !.hist = hist]
+      req == Lead(a) \o hist
   IN /\ ~active.on
      /\ sessions < MaxSessions
      /\ sessions' = s
-     /\ active' = [on |-> TRUE, w |-> w, s |-> s, n |-> 0, br |-> br, hist |-> hist,
-                   last |-> Instructions(w, br) \o hist, switched |-> FALSE]
-     /\ Send(w, s, br, hist, TRUE, <<>>, FALSE)
+     /\ active' = [a EXCEPT !.last = req]
+     /\ Send(w, s, req, TRUE, <<>>, FALSE, 0)
      /\ UNCHANGED branchOf
 
-(* The next request of the session: a tool step, a new user turn, or a tool *)
-(* step after the agent switched branches (the turn context changes).       *)
+(* The next request of the session. "step" is a tool step and "turn" a new *)
+(* user turn; "switch", "deliver" and "skill" are the events in Events,    *)
+(* described above. Each event happens at most once per session.           *)
 Continue(kind) ==
   LET a == active
       n == a.n + 1
+      isTurn == kind \in {"turn", "skill"}
       br == IF kind = "switch" THEN "b2" ELSE a.br
-      hist == Append(a.hist, Block(IF kind = "turn" THEN "user" ELSE "asst",
-                                   ToString(a.s) \o "." \o ToString(n)))
+      swapped == IF isTurn /\ Notes /\ a.skillText > 0
+                 THEN [a.hist EXCEPT ![a.skillText] = Block("skillnote", "k")]
+                 ELSE a.hist
+      kept == IF isTurn /\ Notes /\ Mutation = "note_not_saved"
+              THEN SelectSeq(swapped, LAMBDA b : b.k # "note")
+              ELSE swapped
+      withMsg == Append(kept, Block(IF isTurn THEN "user" ELSE "asst",
+                                    ToString(a.s) \o "." \o ToString(n)))
+      hist == CASE Notes /\ kind = "switch" -> Append(withMsg, Block("note", "branch"))
+                [] Notes /\ kind = "deliver" -> Append(withMsg, Block("note", "scoped"))
+                [] Notes /\ kind = "skill" -> Append(withMsg, Block("skilltext", "k"))
+                [] OTHER -> withMsg
+      next == [a EXCEPT !.n = n, !.br = br, !.hist = hist,
+                        !.switched = a.switched \/ kind = "switch",
+                        !.delivered = a.delivered \/ kind = "deliver",
+                        !.skilled = a.skilled \/ kind = "skill",
+                        !.scopedStable = a.scopedStable \/ (isTurn /\ a.scopedTurn),
+                        !.scopedTurn = (IF isTurn THEN FALSE
+                                        ELSE a.scopedTurn \/ (~Notes /\ kind = "deliver")),
+                        !.skill = (IF isTurn THEN ~Notes /\ kind = "skill" ELSE a.skill),
+                        !.skillUser = (IF kind = "skill" THEN Len(withMsg)
+                                       ELSE IF isTurn THEN 0 ELSE a.skillUser),
+                        !.skillText = (IF Notes /\ kind = "skill" THEN Len(hist)
+                                       ELSE IF isTurn THEN 0 ELSE a.skillText)]
+      req == Lead(next) \o hist
+      \* On the turn after a named skill, only the history before that turn's
+      \* user message must be read.
+      keep == IF isTurn /\ a.skillUser > 0
+              THEN Len(a.last) - Len(a.hist) + a.skillUser - 1
+              ELSE LastKept(a.last)
   IN /\ a.on
      /\ a.n < MaxSteps
+     /\ kind \in {"switch", "deliver", "skill"} => kind \in Events
      /\ kind = "switch" => ~a.switched
-     /\ active' = [a EXCEPT !.n = n, !.br = br, !.hist = hist,
-                            !.last = Instructions(a.w, br) \o hist,
-                            !.switched = a.switched \/ kind = "switch"]
-     /\ Send(a.w, a.s, br, hist, FALSE, a.last, kind = "switch")
+     /\ kind = "deliver" => ~a.delivered
+     /\ kind = "skill" => ~a.skilled
+     /\ active' = [next EXCEPT !.last = req]
+     /\ Send(a.w, a.s, req, FALSE, a.last, kind \in {"switch", "deliver", "skill"}, keep)
      /\ branchOf' = [branchOf EXCEPT ![a.w] = br]
      /\ UNCHANGED sessions
 
@@ -222,7 +302,7 @@ ExternalSwitch(w) ==
 
 Next ==
   \/ \E w \in Worktrees : Start(w)
-  \/ \E kind \in {"step", "turn", "switch"} : Continue(kind)
+  \/ \E kind \in {"step", "turn", "switch", "deliver", "skill"} : Continue(kind)
   \/ End
   \/ \E w \in Worktrees : ExternalSwitch(w)
 
@@ -263,9 +343,16 @@ SessionReuse ==
 ContextChangeKeepsStable ==
   \A i \in 1..Len(log) : log[i].changed => log[i].read >= PosStable
 
-(* When the turn context changes mid-session, the history is still read.    *)
-(* Lesson 4: no design here has it, because the turn context sits ahead of  *)
-(* the history. Checked so the gap stays visible.                           *)
+(* When the turn context changes mid-session, the history is still read.   *)
+(* Only the notes design has it; elsewhere the turn context sits ahead of  *)
+(* the history, and gap-history.cfg keeps that gap visible.                *)
 ContextChangeKeepsHistory ==
   \A i \in 1..Len(log) : log[i].changed => log[i].read >= Len(log[i].prev)
+
+(* Within a session, each request reads all of the previous one except the *)
+(* notes at its end, and on the turn after a named skill, all history      *)
+(* before that turn's user message. fx today misses it: mid-session        *)
+(* changes sit ahead of the history.                                       *)
+MidSessionKeepsHistory ==
+  \A i \in 1..Len(log) : ~log[i].first => log[i].read >= log[i].keep
 =============================================================================

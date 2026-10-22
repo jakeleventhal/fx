@@ -17,30 +17,51 @@
 (***************************************************************************)
 EXTENDS PromptCacheObserved, Naturals, Sequences, FiniteSets, TLC
 
-CONSTANTS Design, Family
+CONSTANTS Design, Family, Notes
 
 VARIABLES i, cache, log
 vars == <<i, cache, log>>
 
 PC == INSTANCE PromptCache WITH
   Mutation <- "none", Worktrees <- {}, RepoOf <- [w \in {} |-> "none"],
-  MaxSessions <- 0, MaxSteps <- 0, Limit <- 4, PathScoped <- TRUE,
+  MaxSessions <- 0, MaxSteps <- 0, Limit <- 4, PathScoped <- TRUE, Events <- {"switch", "deliver", "skill"},
   sessions <- 0, active <- 0, branchOf <- 0
 
 Kinds == <<"tools", "base", "skills", "project", "mcp", "ctx", "rt">>
 
+Has(req, kind) == \E j \in 1..Len(req) : req[j].k = kind
+
+\* Blocks today's fx adds ahead of the history mid-session, and the blocks the
+\* notes design adds inside it.
+Inserted == {"scoped", "skill"}
+Noted == {"note", "skilltext", "skillnote"}
+
 Layout(req) ==
-  /\ Len(req) > PC!NInstr
-  /\ \A j \in 1..PC!NInstr : req[j].k = Kinds[j]
-  /\ \A j \in (PC!NInstr + 1)..Len(req) : req[j].k \in {"user", "asst"}
-  /\ \E j \in (PC!NInstr + 1)..Len(req) : req[j].k = "user"
+  /\ Has(req, "rt")
+  /\ LET lead == SubSeq(req, 1, PC!NInstr(req))
+         base == SelectSeq(lead, LAMBDA b : b.k \notin Inserted)
+     IN /\ Len(base) = Len(Kinds)
+        /\ \A j \in 1..Len(Kinds) : base[j].k = Kinds[j]
+        /\ Notes => Len(base) = Len(lead)
+  /\ Len(req) > PC!NInstr(req)
+  /\ \A j \in (PC!NInstr(req) + 1)..Len(req) :
+       req[j].k \in {"user", "asst"} \cup (IF Notes THEN Noted ELSE {})
+  /\ \E j \in (PC!NInstr(req) + 1)..Len(req) : req[j].k = "user"
 
 \* The request before n in the same session, or 0 for a session's first.
 Before(n) ==
   LET earlier == {j \in 1..(n - 1) : Observed[j].s = Observed[n].s}
   IN IF earlier = {} THEN 0 ELSE PC!Max(earlier)
 
-Ctx(req) == req[6]
+Ctx(req) == IF Has(req, "ctx") THEN req[PC!PosOf(req, "ctx")] ELSE PC!Block("none", "none")
+
+\* How much of prev the next request must read. On a new user turn after a
+\* named skill, the history before that turn's user message; otherwise all of
+\* prev except the notes at its end.
+Keep(prev, req) ==
+  IF (Has(prev, "skill") \/ Has(prev, "skilltext")) /\ PC!LastUser(req) > PC!LastUser(prev)
+  THEN PC!LastUser(prev) - 1
+  ELSE PC!LastKept(prev)
 
 Init ==
   /\ i = 0
@@ -58,6 +79,7 @@ Next ==
                                read |-> PC!ReadWith(o.req, o.manual, cache),
                                prev |-> IF b = 0 THEN <<>> ELSE Observed[b].req,
                                changed |-> b # 0 /\ Ctx(o.req) # Ctx(Observed[b].req),
+                               keep |-> IF b = 0 THEN 0 ELSE Keep(Observed[b].req, o.req),
                                repoSeen |-> \E j \in 1..i : Observed[j].repo = o.repo,
                                worktreeSeen |-> \E j \in 1..i : Observed[j].w = o.w,
                                anySeen |-> i > 0])
@@ -74,6 +96,8 @@ CrossRepoReuse == PC!CrossRepoReuse
 SameWorktreeReuse == PC!SameWorktreeReuse
 WorktreeReuse == PC!WorktreeReuse
 ContextChangeKeepsStable == PC!ContextChangeKeepsStable
+ContextChangeKeepsHistory == PC!ContextChangeKeepsHistory
+MidSessionKeepsHistory == PC!MidSessionKeepsHistory
 
 ReplayIncomplete == i < Len(Observed)
 =============================================================================

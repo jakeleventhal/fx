@@ -1844,7 +1844,12 @@ fn writeExecutionMemoryJsonFrom(
     image_mode: anytype,
 ) !void {
     std.debug.assert(from.tool_steps <= execution.tool_steps.len and from.files <= execution.files.len and from.steering <= execution.steering.len);
-    try writer.writeAll(if (format == .durable)
+    // Version 11 adds `context_notes` (D93). Only an execution with notes uses
+    // it, so one without keeps version 10 and its exact bytes; an older fx
+    // rejects version 11 as it rejects every newer version.
+    try writer.writeAll(if (format == .durable and execution.context_notes.len > 0)
+        "{\"schema_version\":11,\"tool_steps\":["
+    else if (format == .durable)
         "{\"schema_version\":10,\"tool_steps\":["
     else
         "{\"schema_version\":3,\"tool_steps\":[");
@@ -1861,6 +1866,20 @@ fn writeExecutionMemoryJsonFrom(
     for (execution.steering[from.steering..], 0..) |steering, i| {
         if (i > 0) try writer.writeByte(',');
         try writeExecutionSteering(writer, steering, format);
+    }
+    if (format == .durable and execution.context_notes.len > 0) {
+        // Only an execution with notes names them, so one without stays as
+        // before (D93). A delta writes them whole: the journal's merge keeps
+        // the delta's list (`journal.zig` mergeDelta).
+        try writer.writeAll("],\"context_notes\":[");
+        for (execution.context_notes, 0..) |note, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"text\":");
+            try writeExecutionBytes(writer, note.text, format);
+            try writer.print(",\"after_tool_step_count\":{d},\"sources\":", .{note.after_tool_step_count});
+            try std.json.Stringify.value(note.sources, .{}, writer);
+            try writer.writeByte('}');
+        }
     }
     if (format == .durable) {
         try writer.writeAll("],\"turn_summary\":");
@@ -2518,6 +2537,7 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
         5 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" }),
         6 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
         7...10 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
+        11 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "context_notes", "turn_summary" }),
         else => return error.InvalidSessionFormat,
     };
     const tool_steps = try parseToolSteps(
@@ -2539,6 +2559,11 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
     else
         &.{};
     errdefer types.freePersistedSteering(alloc, steering);
+    const context_notes: []types.PersistedContextNote = if (object.get("context_notes")) |notes|
+        try parsePersistedContextNotes(alloc, notes, tool_steps.len)
+    else
+        &.{};
+    errdefer types.freePersistedContextNotes(alloc, context_notes);
     const turn_summary = if (schema_version >= 5)
         try parseOptionalTurnSummary(object.get("turn_summary").?)
     else
@@ -2547,8 +2572,59 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
         .tool_steps = tool_steps,
         .files = files,
         .steering = steering,
+        .context_notes = context_notes,
         .turn_summary = turn_summary,
     };
+}
+
+/// Caller owns the result. Boundaries never decrease and never pass the
+/// turn's steps.
+fn parsePersistedContextNotes(
+    alloc: Allocator,
+    value: std.json.Value,
+    tool_step_count: usize,
+) ![]types.PersistedContextNote {
+    if (value != .array) return error.InvalidSessionFormat;
+    if (value.array.items.len == 0) return &.{};
+    const notes = try alloc.alloc(types.PersistedContextNote, value.array.items.len);
+    errdefer alloc.free(notes);
+    var parsed_count: usize = 0;
+    errdefer for (notes[0..parsed_count]) |item| types.freePersistedContextNote(alloc, item);
+    var prior: usize = 0;
+    for (value.array.items, notes) |item, *dest| {
+        const object = try exactObject(item, &.{ "text", "after_tool_step_count", "sources" });
+        const after_tool_step_count = try requireUsize(object, "after_tool_step_count");
+        if (after_tool_step_count > tool_step_count or after_tool_step_count < prior) return error.InvalidSessionFormat;
+        const text = try parseDurableBytes(alloc, object.get("text") orelse return error.InvalidSessionFormat);
+        errdefer alloc.free(text);
+        dest.* = .{
+            .text = text,
+            .after_tool_step_count = after_tool_step_count,
+            .sources = try parseNoteSources(alloc, object.get("sources") orelse return error.InvalidSessionFormat),
+        };
+        parsed_count += 1;
+        prior = after_tool_step_count;
+    }
+    return notes;
+}
+
+/// The instruction files a note delivered. Caller owns the result.
+fn parseNoteSources(alloc: Allocator, value: std.json.Value) ![]types.ContextNoteSource {
+    if (value != .array) return error.InvalidSessionFormat;
+    if (value.array.items.len == 0) return &.{};
+    const sources = try alloc.alloc(types.ContextNoteSource, value.array.items.len);
+    errdefer alloc.free(sources);
+    var parsed: usize = 0;
+    errdefer for (sources[0..parsed]) |source| alloc.free(source.path);
+    for (value.array.items, sources) |item, *dest| {
+        const object = try exactObject(item, &.{ "path", "stamp" });
+        const path = try requireString(object, "path");
+        if (path.len == 0) return error.InvalidSessionFormat;
+        const stamp = try requireU64(object, "stamp");
+        dest.* = .{ .path = try alloc.dupe(u8, path), .stamp = stamp };
+        parsed += 1;
+    }
+    return sources;
 }
 
 fn parsePersistedSteering(
@@ -2904,7 +2980,8 @@ fn parseToolResultWith(
             try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_image_handle"}))
         else
             try exactObject(value, v4_keys), .extended = true },
-        10 => blk: {
+        // Version 11 changed only the execution's keys (D93).
+        10, 11 => blk: {
             const keys = v4_keys.* ++ [_][]const u8{"review_feedback"};
             break :blk .{ .object = if (value == .object and value.object.contains("tool_images"))
                 try exactObject(value, &(keys ++ [_][]const u8{"tool_images"}))
@@ -4759,6 +4836,91 @@ test "execution memory codec preserves feedback and reads v1 results without it"
         error.InvalidSessionFormat,
         parseHistoryTurn(alloc, invalid_v7_parsed.value),
     );
+}
+
+test "execution memory codec writes context notes only for a turn that has them and reads data without them (D93)" {
+    const alloc = std.testing.allocator;
+    var calls = [_]session.ToolCall{.{ .id = "call_note", .name = "read_file", .arguments_json = "{}" }};
+    var results = [_]session.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_note"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("ok"),
+        .output_bytes = 2,
+        .stored_output_bytes = 2,
+    }};
+    var steps = [_]session.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
+    var delivered = [_]types.ContextNoteSource{
+        .{ .path = "/w/sub/AGENTS.md", .stamp = 0x1F_FFFF_FFFF_FFFF },
+        .{ .path = "/w/gone/AGENTS.md", .stamp = 0 },
+    };
+    var notes = [_]types.PersistedContextNote{
+        .{ .text = @constCast("rules at start"), .after_tool_step_count = 0 },
+        .{ .text = @constCast("rules after the step"), .after_tool_step_count = 1, .sources = &delivered },
+    };
+    for ([_]bool{ false, true }) |with_notes| {
+        const turn: session.HistoryTurn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast("done"),
+            .execution = .{ .tool_steps = steps[0..], .context_notes = if (with_notes) notes[0..] else &.{} },
+        } };
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeHistoryTurn(&encoded.writer, turn);
+        try std.testing.expectEqual(with_notes, std.mem.find(u8, encoded.written(), "\"context_notes\"") != null);
+        // Only an execution with notes moves to version 11.
+        const version = if (with_notes) "\"schema_version\":11" else "\"schema_version\":10";
+        if (std.mem.find(u8, encoded.written(), version) == null) {
+            std.debug.print("expected {s} in {s}\n", .{ version, encoded.written() });
+            return error.TestUnexpectedResult;
+        }
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        const decoded = parseHistoryTurn(alloc, parsed.value) catch |err| {
+            std.debug.print("turn with_notes={} did not parse ({s}): {s}\n", .{ with_notes, @errorName(err), encoded.written() });
+            return err;
+        };
+        defer session.freeHistoryTurn(alloc, decoded);
+        const decoded_notes = decoded.assistant.execution.context_notes;
+        try std.testing.expectEqual(@as(usize, if (with_notes) notes.len else 0), decoded_notes.len);
+        for (decoded_notes, notes[0..decoded_notes.len]) |got, want| {
+            try std.testing.expectEqualStrings(want.text, got.text);
+            try std.testing.expectEqual(want.after_tool_step_count, got.after_tool_step_count);
+            try std.testing.expectEqual(want.sources.len, got.sources.len);
+            for (want.sources, got.sources) |want_source, got_source| {
+                try std.testing.expectEqualStrings(want_source.path, got_source.path);
+                try std.testing.expectEqual(want_source.stamp, got_source.stamp);
+            }
+        }
+        // Presentation JSON never shows them.
+        var shown: std.Io.Writer.Allocating = .init(alloc);
+        defer shown.deinit();
+        try writeExecutionMemoryJson(&shown.writer, turn.assistant.execution, .presentation);
+        try std.testing.expect(std.mem.find(u8, shown.written(), "context_notes") == null);
+    }
+
+    // Data an fx without notes wrote parses; notes need version 11, and notes
+    // past the turn's steps do not parse.
+    for ([_]struct { json: []const u8, valid: bool }{
+        .{ .json = "{\"schema_version\":10,\"tool_steps\":[],\"files\":[],\"steering\":[],\"turn_summary\":null}", .valid = true },
+        .{ .json = "{\"schema_version\":10,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[{\"text\":\"n\",\"after_tool_step_count\":0}],\"turn_summary\":null}", .valid = false },
+        .{ .json = "{\"schema_version\":11,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[{\"text\":\"n\",\"after_tool_step_count\":0,\"sources\":[{\"path\":\"/w/sub/AGENTS.md\",\"stamp\":7}]}],\"turn_summary\":null}", .valid = true },
+        .{ .json = "{\"schema_version\":11,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[{\"text\":\"n\",\"after_tool_step_count\":1,\"sources\":[]}],\"turn_summary\":null}", .valid = false },
+        .{ .json = "{\"schema_version\":6,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"turn_summary\":null}", .valid = false },
+    }) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
+        defer parsed.deinit();
+        if (!case.valid) {
+            try std.testing.expectError(error.InvalidSessionFormat, parseExecutionMemory(alloc, parsed.value));
+            continue;
+        }
+        const execution = parseExecutionMemory(alloc, parsed.value) catch |err| {
+            std.debug.print("case did not parse ({s}): {s}\n", .{ @errorName(err), case.json });
+            return err;
+        };
+        defer session.freeExecutionMemory(alloc, execution);
+        try std.testing.expectEqual(@as(usize, @intFromBool(std.mem.find(u8, case.json, "context_notes") != null)), execution.context_notes.len);
+    }
 }
 
 test "committed file presentation codec reads shipped and spilled shapes" {

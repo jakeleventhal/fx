@@ -2276,8 +2276,50 @@ pub fn appendExecutionMemoryChatMessages(
     messages: *std.ArrayList(core_types.ChatMessage),
     execution: core_types.ExecutionMemory,
 ) !void {
+    try appendExecutionChatMessagesPlacing(alloc, messages, execution, .before_steering);
+}
+
+/// Where a saved turn's file evidence goes among its messages.
+const FileEvidencePlacement = enum {
+    /// After the last step's notes, before the steering that follows them.
+    before_steering,
+    /// Left for the caller to add after the turn's answer.
+    held_back,
+};
+
+/// A turn whose last step boundary has context notes sent them right before
+/// its answer, so its file evidence follows the answer (D93). Before it, the
+/// evidence would sit between the step's results and the notes, which the
+/// live turn never sent, and the next turn would miss the cache from there.
+fn fileEvidenceFollowsAnswer(execution: core_types.ExecutionMemory) bool {
+    if (execution.files.len == 0) return false;
+    for (execution.context_notes) |note| {
+        if (note.after_tool_step_count == execution.tool_steps.len) return true;
+    }
+    return false;
+}
+
+fn appendExecutionFileEvidence(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    execution: core_types.ExecutionMemory,
+) !void {
+    if (execution.files.len == 0) return;
+    const text = try formatExecutionFileContext(alloc, execution.files);
+    errdefer alloc.free(text);
+    try messages.append(alloc, .{ .role = .user, .content = text });
+}
+
+fn appendExecutionChatMessagesPlacing(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    execution: core_types.ExecutionMemory,
+    evidence: FileEvidencePlacement,
+) !void {
     var steering_index: usize = 0;
+    var note_index: usize = 0;
     for (execution.tool_steps, 0..) |step, step_index| {
+        try appendContextNoteChatMessages(alloc, messages, execution.context_notes, &note_index, step_index);
         while (steering_index < execution.steering.len and
             execution.steering[steering_index].after_tool_step_count == step_index)
         {
@@ -2318,11 +2360,10 @@ pub fn appendExecutionMemoryChatMessages(
             }
         }
     }
-    if (execution.files.len > 0) {
-        const text = try formatExecutionFileContext(alloc, execution.files);
-        errdefer alloc.free(text);
-        try messages.append(alloc, .{ .role = .user, .content = text });
-    }
+    // Notes after the last step follow its results, as the turn sent them,
+    // and come before the file context a saved turn adds.
+    try appendContextNoteChatMessages(alloc, messages, execution.context_notes, &note_index, null);
+    if (evidence == .before_steering) try appendExecutionFileEvidence(alloc, messages, execution);
     while (steering_index < execution.steering.len) : (steering_index += 1) {
         const steering = execution.steering[steering_index];
         if (steering.assistant_prefix) |prefix| {
@@ -2331,6 +2372,22 @@ pub fn appendExecutionMemoryChatMessages(
             }
         }
         try messages.append(alloc, restoredSteeringChatMessage(steering.text));
+    }
+}
+
+/// Appends, as flagged system messages, the notes saved after `step_index`
+/// steps, or every remaining note when null (D93). Borrows their text.
+fn appendContextNoteChatMessages(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    notes: []const core_types.PersistedContextNote,
+    index: *usize,
+    step_index: ?usize,
+) !void {
+    while (index.* < notes.len) : (index.* += 1) {
+        const note = notes[index.*];
+        if (step_index) |count| if (note.after_tool_step_count != count) break;
+        try messages.append(alloc, .{ .role = .system, .content = note.text, .context_note = true, .context_note_sources = note.sources });
     }
 }
 
@@ -2382,10 +2439,13 @@ fn appendHistoryChatMessagesImpl(
             },
             .assistant => |entry| {
                 try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
-                try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
-                if (entry.assistant.len > 0 or entry.provider_replay != null) {
+                const answered = entry.assistant.len > 0 or entry.provider_replay != null;
+                const evidence_after_answer = answered and fileEvidenceFollowsAnswer(entry.execution);
+                try appendExecutionChatMessagesPlacing(alloc, messages, entry.execution, if (evidence_after_answer) .held_back else .before_steering);
+                if (answered) {
                     try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant, .provider_replay = entry.provider_replay });
                 }
+                if (evidence_after_answer) try appendExecutionFileEvidence(alloc, messages, entry.execution);
             },
             .interrupted => |entry| {
                 try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
@@ -2715,6 +2775,95 @@ test "resume history preserves steering between tool episodes" {
     }
     try std.testing.expectEqualStrings("after first", messages.items[3].content.?.asText());
     try std.testing.expectEqualStrings("after second", messages.items[6].content.?.asText());
+}
+
+test "resume history keeps context notes between tool episodes, before steering, with the file context after the answer (D93)" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var first_calls = [_]ToolCall{.{ .id = "call_first", .name = "read_file", .arguments_json = "{\"path\":\"first\"}" }};
+    var first_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_first"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("first result"),
+        .output_bytes = "first result".len,
+        .stored_output_bytes = "first result".len,
+    }};
+    var second_calls = [_]ToolCall{.{ .id = "call_second", .name = "read_file", .arguments_json = "{\"path\":\"second\"}" }};
+    var second_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_second"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("second result"),
+        .output_bytes = "second result".len,
+        .stored_output_bytes = "second result".len,
+    }};
+    var steps = [_]ToolExecutionStep{
+        .{ .tool_calls = &first_calls, .tool_results = &first_results },
+        .{ .tool_calls = &second_calls, .tool_results = &second_results },
+    };
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = @constCast("after first"), .after_tool_step_count = 1 },
+        .{ .text = @constCast("after second"), .after_tool_step_count = 2 },
+    };
+    var notes = [_]core_types.PersistedContextNote{
+        .{ .text = @constCast("note after first"), .after_tool_step_count = 1 },
+        .{ .text = @constCast("note after second"), .after_tool_step_count = 2 },
+    };
+    var files = [_]core_types.FileEvidence{.{
+        .path = @constCast("first"),
+        .tool_call_id = @constCast("call_first"),
+        .tool_name = @constCast("read_file"),
+        .action = .read,
+    }};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("run both") },
+        .assistant = @constCast("finished"),
+        .execution = .{
+            .tool_steps = &steps,
+            .files = &files,
+            .steering = &steering,
+            .context_notes = &notes,
+        },
+    } }};
+
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendHistoryChatMessages(arena, &messages, &history);
+    const expected = [_]struct { core_types.ChatRole, ?[]const u8 }{
+        .{ .user, "run both" },
+        .{ .assistant, null },
+        .{ .tool, "first result" },
+        .{ .system, "note after first" },
+        .{ .user, "after first" },
+        .{ .assistant, null },
+        .{ .tool, "second result" },
+        .{ .system, "note after second" },
+        .{ .user, "after second" },
+        .{ .assistant, "finished" },
+        .{ .user, null },
+    };
+    try std.testing.expectEqual(expected.len, messages.items.len);
+    for (expected, messages.items) |want, got| {
+        try std.testing.expectEqual(want[0], got.role);
+        try std.testing.expectEqual(want[0] == .system, got.context_note);
+        if (want[1]) |text| try std.testing.expectEqualStrings(text, got.content.?);
+    }
+    // The last step's note came right before the answer, so the file context
+    // a saved turn adds follows the answer.
+    try std.testing.expect(std.mem.find(u8, messages.items[10].content.?, "first") != null);
+
+    // Without a note at the last step, the file context stays before the
+    // last steering and the answer.
+    var history_without = history;
+    history_without[0].assistant.execution.context_notes = notes[0..1];
+    var without: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendHistoryChatMessages(arena, &without, &history_without);
+    try std.testing.expectEqual(expected.len - 1, without.items.len);
+    try std.testing.expect(std.mem.find(u8, without.items[7].content.?, "first") != null);
+    try std.testing.expectEqualStrings("after second", without.items[8].content.?);
+    try std.testing.expectEqualStrings("finished", without.items[9].content.?);
 }
 
 test "resume projection replays assistant tool execution memory before final answer" {

@@ -31,7 +31,9 @@ export type Verdict = "ACCEPTED" | "REJECTED" | "INCONCLUSIVE" | "TOOL_ERROR";
 export type PropertyVerdict = "HOLDS" | "VIOLATED" | "TOOL_ERROR";
 
 export const PROPERTIES = ["Budget", "SessionReuse", "CrossRepoReuse", "SameWorktreeReuse", "WorktreeReuse", "ContextChangeKeepsStable"] as const;
-export type Property = (typeof PROPERTIES)[number];
+/** Checked by midsession.test.ts on sessions with mid-session context changes. */
+export const MID_PROPERTIES = ["MidSessionKeepsHistory"] as const;
+export type Property = (typeof PROPERTIES)[number] | (typeof MID_PROPERTIES)[number];
 
 export interface Block { k: string; v: string }
 
@@ -68,16 +70,20 @@ export interface RuntimeResult {
 const tlaDir = join(TLA_ROOT, "prompt_context");
 const SPECS = ["PromptCache.tla", "PromptCacheTrace.tla"];
 const ORDER = ["base", "skills", "project", "mcp", "ctx", "rt"] as const;
-const NINSTR = 7;
-const POS_PROFILE = 2;
-const POS_STABLE = 5;
 
 const sha = (text: string) => createHash("sha256").update(text).digest("hex");
 const short = (text: string) => sha(text).slice(0, 16);
 
-type SystemKind = (typeof ORDER)[number] | "other";
+/** Blocks today's fx inserts ahead of the history mid-session. */
+const INSERTED = ["scoped", "skill"] as const;
+const SKILL_TEXT = "Explicitly invoked skill content for this query:";
+
+type SystemKind = (typeof ORDER)[number] | (typeof INSERTED)[number] | "other";
 
 function systemKind(content: string): SystemKind {
+  // Rules delivered at tool time: scoped rules with the guidance preamble, but no project rules.
+  if (content.includes("<scoped-rules") && !content.includes("<project-rules")) return "scoped";
+  if (content.startsWith(SKILL_TEXT)) return "skill";
   if (content.startsWith("Skills provide task instructions") || content.includes("<available_skills>")) return "skills";
   if (content.startsWith("<project-instructions-guidance>") || content.includes("<project-rules")) return "project";
   if (content.startsWith("Configured MCP servers")) return "mcp";
@@ -98,6 +104,14 @@ function hasMarker(message: any, family: Family): boolean {
     return message.content.some((part: any) => marker(part?.providerOptions));
   }
   return false;
+}
+
+/** A system message inside the conversation, as the notes design sends it, or null. */
+function noteKind(content: string): "note" | "skilltext" | "skillnote" | null {
+  if (content.startsWith("<fx-context-update>") || content.includes("<scoped-rules")) return "note";
+  if (content.startsWith(SKILL_TEXT)) return "skilltext";
+  if (content.startsWith("<fx-skill-used")) return "skillnote";
+  return null;
 }
 
 function text(message: any): string {
@@ -138,7 +152,17 @@ export function abstractRequest(body: string, family: Family): Abstraction {
       groups.at(-1)!.messages.push(i);
       continue;
     }
-    const at = ORDER.indexOf(kind);
+    if (kind === "scoped" || kind === "skill") {
+      // Today's fx: rules delivered this turn follow the MCP group and move
+      // after the project rules on later turns; a named skill's text comes
+      // right before the turn context.
+      const after = groups.at(-1)!.kind;
+      const allowed = kind === "scoped" ? ["project", "mcp"] : ["mcp", "scoped"];
+      if (!allowed.includes(after)) errors.push(`system message ${i} (${kind}) follows ${after}`);
+      groups.push({ kind, messages: [i] });
+      continue;
+    }
+    const at = ORDER.indexOf(kind as (typeof ORDER)[number]);
     if (kind === "rt" && groups.at(-1)!.kind === "rt") {
       groups.at(-1)!.messages.push(i);
       continue;
@@ -151,7 +175,7 @@ export function abstractRequest(body: string, family: Family): Abstraction {
     group = at;
     groups.push({ kind, messages: [i] });
   }
-  const kinds = groups.map((g) => g.kind);
+  const kinds = groups.map((g) => g.kind).filter((k) => !(INSERTED as readonly string[]).includes(k));
   if (JSON.stringify(kinds) !== JSON.stringify(ORDER)) {
     errors.push(`instruction groups ${kinds.join(",")} differ from ${ORDER.join(",")}`);
   }
@@ -172,7 +196,14 @@ export function abstractRequest(body: string, family: Family): Abstraction {
   for (; i < prompt.length; i += 1) {
     const role = prompt[i].role;
     if (role === "system") {
-      errors.push(`system message ${i} after the conversation started`);
+      const kind = noteKind(text(prompt[i]));
+      if (kind === null) {
+        errors.push(`system message ${i} after the conversation started`);
+        continue;
+      }
+      blocks.push({ k: kind, v: short(text(prompt[i])) });
+      sources.push([i]);
+      marked.push(hasMarker(prompt[i], family));
       continue;
     }
     if (role === "user") {
@@ -181,8 +212,10 @@ export function abstractRequest(body: string, family: Family): Abstraction {
       marked.push(hasMarker(prompt[i], family));
       continue;
     }
+    // One model response is one block: an assistant message and the tool
+    // results that follow it.
     const last = blocks.at(-1)!;
-    if (last.k === "asst") {
+    if (last.k === "asst" && role !== "assistant") {
       sources.at(-1)!.push(i);
       last.v = short(sources.at(-1)!.map((m) => text(prompt[m])).join("\u0000"));
       if (marked.at(-1)) errors.push(`marker inside an assistant run (before message ${i})`);
@@ -240,7 +273,7 @@ export function derive(observed: ObservedRequest[]): Derived[] {
     const earlier = observed.slice(0, n);
     const sameSession = earlier.filter((e) => e.s === o.s);
     const prev = sameSession.at(-1) ?? null;
-    const ctx = (r: ObservedRequest) => r.req[5]?.v;
+    const ctx = (r: ObservedRequest) => r.req.find((b) => b.k === "ctx")?.v;
     const sameWorktree = earlier.filter((e) => e.w === o.w);
     return {
       first: prev === null,
@@ -265,8 +298,13 @@ export function coverage(observed: ObservedRequest[]): Record<Property, number> 
     // A new worktree of a repository that already ran.
     WorktreeReuse: d.filter((x) => x.first && !x.worktreeSeen && x.repoSeen).length,
     ContextChangeKeepsStable: d.filter((x) => x.changed).length,
+    // A request at or after a mid-session change: inserted, noted or switched.
+    MidSessionKeepsHistory: d.filter((x, n) => !x.first && (x.changed ||
+      [observed[n]!, x.prev!].some((r) => r.req.some((b) => MID_KINDS.has(b.k))))).length,
   };
 }
+
+const MID_KINDS = new Set(["scoped", "skill", "note", "skilltext", "skillnote"]);
 
 export interface TimelineRow {
   seq: number; s: number; w: string; first: boolean; changed: boolean;
@@ -290,10 +328,11 @@ export function simulate(observed: ObservedRequest[], family: Family): TimelineR
       for (const bp of bps) cache.add(key(o.req, bp));
     } else {
       // PromptCache Lookup: only lookup candidates; the developer block end is written too.
-      bps = sorted([...o.manual, o.req.length]);
-      const eligible = o.req.flatMap((b, j) => (j + 1 > NINSTR && (b.k === "user" || b.k === "asst") ? [j + 1] : []));
-      for (const m of sorted([...bps, ...eligible, NINSTR])) if (cache.has(key(o.req, m))) read = m;
-      for (const bp of [...bps, NINSTR]) cache.add(key(o.req, bp));
+      const instr = o.req.findIndex((b) => b.k === "rt") + 1;
+      const eligible = o.req.flatMap((b, j) => (j + 1 > instr && (b.k === "user" || b.k === "asst") ? [j + 1] : []));
+      bps = sorted([...o.manual, Math.max(instr, ...eligible)]);
+      for (const m of sorted([...bps, ...eligible, instr])) if (cache.has(key(o.req, m))) read = m;
+      for (const bp of [...bps, instr]) cache.add(key(o.req, bp));
     }
     return { seq: o.seq, s: o.s, w: o.w, first: d[n]!.first, changed: d[n]!.changed, blocks: o.req.length, manual: o.manual, breakpoints: bps, read };
   });
@@ -302,7 +341,8 @@ export function simulate(observed: ObservedRequest[], family: Family): TimelineR
 export function timelineMarkdown(rows: TimelineRow[]): string {
   const lines = [
     "Diagnostic timeline, computed by bridge.ts simulate(); TLC gives the verdicts.",
-    `Block positions: 1 tools, 2 base, 3 skills, 4 project, 5 mcp, 6 turn context, 7 runtime notes, 8+ conversation.`,
+    "Block order: tools, base, skills, project, mcp, turn context, runtime notes, then the conversation. Rules delivered",
+    "mid-session and a named skill's text add blocks before the turn context; the notes design adds them inside the conversation.",
     "",
     "| request | session | worktree | first | context changed | blocks | manual markers | all markers | blocks read |",
     "|---|---|---|---|---|---|---|---|---|",
@@ -314,15 +354,15 @@ export function timelineMarkdown(rows: TimelineRow[]): string {
   return `${lines.join("\n")}\n`;
 }
 
-function cfg(design: Design, family: Family, invariants: string[]): string {
-  return ["SPECIFICATION Spec", "CONSTANTS", `  Design = "${design}"`, `  Family = "${family}"`, "INVARIANTS",
+function cfg(design: Design, family: Family, notes: boolean, invariants: string[]): string {
+  return ["SPECIFICATION Spec", "CONSTANTS", `  Design = "${design}"`, `  Family = "${family}"`, `  Notes = ${notes ? "TRUE" : "FALSE"}`, "INVARIANTS",
     ...invariants.map((x) => `  ${x}`), ""].join("\n");
 }
 
-async function trace(dir: string, observed: ObservedRequest[], design: Design, family: Family, invariants: string[]): Promise<TlcRun> {
+async function trace(dir: string, observed: ObservedRequest[], design: Design, family: Family, notes: boolean, invariants: string[]): Promise<TlcRun> {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "PromptCacheObserved.tla"), observedModule(observed));
-  writeFileSync(join(dir, "PromptCacheTrace.cfg"), cfg(design, family, invariants));
+  writeFileSync(join(dir, "PromptCacheTrace.cfg"), cfg(design, family, notes, invariants));
   return runTlc(dir, "PromptCacheTrace", "PromptCacheTrace.cfg", SPECS, tlaDir, ["-deadlock"]);
 }
 
@@ -330,29 +370,39 @@ async function trace(dir: string, observed: ObservedRequest[], design: Design, f
  * Checks the observed requests against one design: conformance first, then
  * each property on the same replay. Writes every TLC run under `reports`.
  */
-export async function checkRuntime(observed: ObservedRequest[], design: Design, family: Family, reports: string): Promise<RuntimeResult> {
+export interface CheckOptions {
+  /** PromptCache Notes: mid-session changes are notes after the conversation. */
+  notes?: boolean;
+  properties?: readonly Property[];
+}
+
+export async function checkRuntime(
+  observed: ObservedRequest[], design: Design, family: Family, reports: string, options: CheckOptions = {},
+): Promise<RuntimeResult> {
+  const notes = options.notes ?? false;
+  const properties = options.properties ?? PROPERTIES;
   const cover = coverage(observed);
   const hashes: Record<string, string> = {};
   for (const spec of SPECS) hashes[spec] = sha(readFileSync(join(tlaDir, spec), "utf8"));
   const base: RuntimeResult = { version: 1, design, family, verdict: "INCONCLUSIVE", detail: "", requests: observed.length, coverage: cover, properties: {}, hashes };
-  const missing = PROPERTIES.filter((p) => cover[p] === 0);
+  const missing = properties.filter((p) => cover[p] === 0);
   if (observed.length === 0 || missing.length > 0) {
     return { ...base, detail: observed.length === 0 ? "no requests" : `no request exercises ${missing.join(", ")}` };
   }
   hashes["PromptCacheObserved.tla"] = sha(observedModule(observed));
-  const conformance = await trace(join(reports, design, "conforms"), observed, design, family, ["Conforms", "ReplayIncomplete"]);
-  base.conformanceLog = join(reports, design, "conforms", "tlc.log");
+  const tag = notes ? `${design}-notes` : design;
+  const conformance = await trace(join(reports, tag, "conforms"), observed, design, family, notes, ["Conforms", "ReplayIncomplete"]);
+  base.conformanceLog = join(reports, tag, "conforms", "tlc.log");
   if (conformance.violated === "Conforms") return { ...base, verdict: "REJECTED", detail: `requests do not match the ${design} layout and markers` };
   if (conformance.violated !== "ReplayIncomplete") {
     return { ...base, verdict: "TOOL_ERROR", detail: `TLC exit ${conformance.exitCode}: ${conformance.output.slice(-400)}` };
   }
-  for (const property of PROPERTIES) {
-    const dir = join(reports, design, property);
-    const run = await trace(dir, observed, design, family, ["Conforms", property, "ReplayIncomplete"]);
+  for (const property of properties) {
+    const dir = join(reports, tag, property);
+    const run = await trace(dir, observed, design, family, notes, ["Conforms", property, "ReplayIncomplete"]);
     const verdict: PropertyVerdict = run.violated === "ReplayIncomplete" ? "HOLDS" : run.violated === property ? "VIOLATED" : "TOOL_ERROR";
     base.properties[property] = { verdict, log: join(dir, "tlc.log"), ...(verdict === "TOOL_ERROR" ? { detail: run.output.slice(-400) } : {}) };
   }
   return { ...base, verdict: "ACCEPTED", detail: `${observed.length} requests replayed` };
 }
 
-export { NINSTR, POS_PROFILE, POS_STABLE };

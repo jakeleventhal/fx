@@ -219,3 +219,133 @@ export async function collectObservations(ctx: RunContext): Promise<Capture> {
   writeFileSync(join(artifacts, "sessions.json"), JSON.stringify(sessions, null, 2), { mode: 0o600 });
   return { requests, sessions, artifacts };
 }
+
+interface Turn {
+  prompt: string;
+  /** Scripted Gateway replies for this turn, in order. */
+  replies: (helpers: any, id: string) => Response[];
+}
+
+interface MidSessionPlan {
+  session: number;
+  event: "deliver" | "skill" | "switch";
+  turns: Turn[];
+}
+
+const THANKS: Turn = { prompt: "Thanks.", replies: (h) => [h.fakeGatewayFinalText("ok")] };
+
+// Each session's first turn has the event; the second turn resumes it.
+const MID_PLANS: MidSessionPlan[] = [
+  {
+    session: 1, event: "deliver", turns: [
+      { prompt: "Read the sub notes.", replies: (h, id) => [h.fakeGatewayToolCall(id, "read_file", { path: "sub/notes.md" }), h.fakeGatewayFinalText("done")] },
+      THANKS,
+    ],
+  },
+  {
+    session: 2, event: "skill", turns: [
+      { prompt: "$r1-skill Show the readme.", replies: (h, id) => [h.fakeShellRun(id, "cat README.md"), h.fakeGatewayFinalText("done")] },
+      THANKS,
+    ],
+  },
+  {
+    session: 3, event: "switch", turns: [
+      { prompt: "Start a feature branch.", replies: (h, id) => [h.fakeShellRun(id, "git checkout -q -b agent-switch && cat README.md"), h.fakeGatewayFinalText("done")] },
+      THANKS,
+    ],
+  },
+];
+
+/**
+ * Drives three resumed two-turn sessions in one worktree, each with one
+ * mid-session event in its first turn: rules delivered from sub/AGENTS.md by a
+ * read_file call, a named skill, and an agent branch switch.
+ */
+export async function collectMidSession(ctx: RunContext): Promise<Capture> {
+  const { helpers, binary } = ctx;
+  const artifacts = ctx.artifacts;
+  mkdirSync(join(artifacts, "requests"), { recursive: true, mode: 0o700 });
+  const log = activityLogger(artifacts);
+  const fixtureHome = join(realpathSync(artifacts), "home");
+  mkdirSync(fixtureHome, { recursive: true, mode: 0o700 });
+  const w1 = join(fixtureHome, "src", "r1");
+  mkdirSync(join(w1, "sub"), { recursive: true });
+  writeFileSync(join(w1, "sub", "AGENTS.md"), "# Sub rules\n\nFiles here use tabs.\n");
+  writeFileSync(join(w1, "sub", "notes.md"), "Sub note line one.\n");
+  makeRepo(w1, fixtureHome, "r1");
+  log("fixtures_ready", { home: fixtureHome, w1, binary, model: ctx.model, plans: MID_PLANS.map((p) => p.event) });
+
+  const requests: CapturedRequest[] = [];
+  const sessions: SessionRecord[] = [];
+  let seq = 0;
+  for (const plan of MID_PLANS) {
+    for (const [index, turn] of plan.turns.entries()) {
+      const id = `call_${plan.session}_${index + 1}`;
+      const script = turn.replies(helpers, id);
+      let step = 0;
+      const gateway = helpers.startDynamicFakeGateway(async (body: string) => {
+        step += 1;
+        log("gateway_request_arrived", { session: plan.session, turn: index + 1, step, bytes: body.length, sha256: sha256(body) });
+        const next = script.shift();
+        log("gateway_reply", { session: plan.session, turn: index + 1, step, reply: next ? "scripted" : "unexpected" });
+        return next ?? new Response("unexpected request", { status: 500 });
+      }, { models: [{ id: ctx.model, type: "language", tags: ["tool-use"] }] });
+      const env = testEnvironment({
+        HOME: fixtureHome,
+        AI_GATEWAY_API_KEY: "fake-prompt-cache-key",
+        FX_SKIP_ONBOARDING: "1",
+        FX_MODEL: ctx.model,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      });
+      const resume = index === 0 ? [] : ["--resume", "last"];
+      const argv = [binary, "ask", "--full-access", "--json", ...resume, "--", turn.prompt];
+      log("fx_spawn", { session: plan.session, turn: index + 1, event: plan.event, cwd: w1, argv });
+      const proc = Bun.spawn(argv, { cwd: w1, env, stdout: "pipe", stderr: "pipe" });
+      let timedOut = false;
+      const timer = setTimeout(() => { timedOut = true; proc.kill("SIGKILL"); }, SESSION_TIMEOUT_MS);
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      clearTimeout(timer);
+      gateway.stop();
+      const name = `s${plan.session}-t${index + 1}`;
+      const stdoutFile = join(artifacts, `${name}.stdout`);
+      const stderrFile = join(artifacts, `${name}.stderr`);
+      writeFileSync(stdoutFile, stdout, { mode: 0o600 });
+      writeFileSync(stderrFile, stderr, { mode: 0o600 });
+      const kinds: ["agent" | "title", any[]][] = [["agent", gateway.requests], ["title", gateway.titleRequests]];
+      for (const [kind, list] of kinds) {
+        for (const request of list) {
+          seq += 1;
+          const bodyFile = join(artifacts, "requests", `${String(seq).padStart(3, "0")}-${name}-${kind}.json`);
+          writeFileSync(bodyFile, request.body, { mode: 0o600 });
+          const kept: Record<string, string> = {};
+          for (const [header, value] of request.headers as Headers) {
+            if (header === "authorization") continue;
+            if (header.startsWith("x-session") || header.startsWith("ai-")) kept[header] = value;
+          }
+          const entry: CapturedRequest = {
+            seq, session: plan.session, worktree: "w1", repo: "r1", kind, recordedAt: new Date().toISOString(),
+            bodyFile, bodySha256: sha256(request.body), headers: kept, body: request.body,
+          };
+          requests.push(entry);
+          const { body: _omit, ...line } = entry;
+          appendFileSync(join(artifacts, "requests.jsonl"), `${JSON.stringify({ ...line, turn: index + 1, bytes: request.body.length })}\n`, { mode: 0o600 });
+          log("gateway_request", { seq, session: plan.session, turn: index + 1, kind, bytes: request.body.length, sha256: entry.bodySha256 });
+        }
+      }
+      const session: SessionRecord = {
+        session: plan.session, worktree: "w1", repo: "r1", prompt: turn.prompt, exitCode, timedOut, stdoutFile, stderrFile,
+        agentRequests: gateway.requests.length, titleRequests: gateway.titleRequests.length,
+      };
+      sessions.push(session);
+      log("fx_exit", { ...session, turn: index + 1, event: plan.event });
+    }
+  }
+  writeFileSync(join(artifacts, "sessions.json"), JSON.stringify(sessions, null, 2), { mode: 0o600 });
+  return { requests, sessions, artifacts };
+}

@@ -20,6 +20,13 @@ pub fn cacheMarkers(model: []const u8) model_capabilities.CacheMarkers {
     return .none;
 }
 
+/// Whether fx sends `model` a context note, a system message after the
+/// conversation starts (D93): only the families fx sends cache markers to,
+/// which take such a message without rewriting the cached prefix.
+pub fn takesContextNotes(model: []const u8) bool {
+    return cacheMarkers(model) != .none;
+}
+
 /// Whether `model` takes OpenAI's `promptCacheOptions`: GPT-5.6 and later.
 pub fn takesPromptCacheOptions(model: []const u8) bool {
     const prefix = "openai/gpt-";

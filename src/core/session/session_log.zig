@@ -41,7 +41,8 @@ pub const ConversationProgress = struct {
         if (self.pending_assistant) |assistant| {
             const standalone = switch (event) {
                 .assistant, .context_checkpoint, .interrupted => true,
-                .steering => assistant.has_replay,
+                // A note counts no step, as steering does (D93).
+                .steering, .context_note => assistant.has_replay,
                 else => false,
             };
             if (standalone) {
@@ -159,6 +160,8 @@ const ReplayState = struct {
             },
             .interrupted => self.clearPendingToolCalls(),
             .user, .assistant, .steering, .turn_completed => {},
+            // Only a v2 session saves a context note (D93).
+            .context_note => return error.InvalidConversationFrame,
         }
         self.last_seq = seq;
         self.turn_open = turn_open;
@@ -171,6 +174,8 @@ fn nextConversationTurnOpen(open: bool, event: session_event.ConversationEvent) 
         .turn_completed, .interrupted => if (open) false else error.InvalidConversationFrame,
         .assistant, .tool_call, .tool_result, .steering => if (open) true else error.InvalidConversationFrame,
         .context_checkpoint => open,
+        // v1 logs never hold a context note; only a v2 session saves one (D93).
+        .context_note => error.InvalidConversationFrame,
     };
 }
 
@@ -880,6 +885,8 @@ fn replayConversationHistory(
             .tool_call => |value| try turn.appendToolCall(value),
             .tool_result => |value| try turn.appendToolResult(value),
             .steering => |value| try turn.appendSteering(value.text),
+            // v1 logs never hold a context note; only a v2 session saves one (D93).
+            .context_note => return error.InvalidConversationFrame,
             .turn_completed => |value| {
                 const completed = try turn.finishAssistant(value);
                 checkpoint_turn_open = false;
@@ -971,6 +978,8 @@ const ConversationHistoryReader = struct {
                     try self.builder.appendSteering(value.text);
                     break :blk null;
                 },
+                // v1 logs never hold a context note; only a v2 session saves one (D93).
+                .context_note => return error.InvalidConversationFrame,
                 .turn_completed => |value| try self.builder.finishAssistant(value),
                 .interrupted => |value| try self.builder.finishInterrupted(value),
                 .context_checkpoint => blk: {
@@ -1075,6 +1084,8 @@ fn load_conversation_archive_from_source(
                 try builder.appendSteering(value.text);
                 break :blk null;
             },
+            // v1 logs never hold a context note; only a v2 session saves one (D93).
+            .context_note => return error.InvalidConversationFrame,
             .turn_completed => |value| try builder.finishAssistant(value),
             .interrupted => |value| try builder.finishInterrupted(value),
             .context_checkpoint => |value| blk: {
@@ -1149,6 +1160,8 @@ const ConversationReplayScan = struct {
                     .coverage = checkpoint.covers_through_seq,
                 };
             },
+            // v1 logs never hold a context note; only a v2 session saves one (D93).
+            .context_note => return error.InvalidConversationFrame,
             else => {},
         }
     }
@@ -1211,6 +1224,7 @@ pub const ConversationTurnBuilder = struct {
     results: std.ArrayList(types.PersistedToolResult) = .empty,
     steps: std.ArrayList(types.ToolExecutionStep) = .empty,
     steering: std.ArrayList(types.PersistedSteering) = .empty,
+    context_notes: std.ArrayList(types.PersistedContextNote) = .empty,
 
     pub fn init(alloc: Allocator) ConversationTurnBuilder {
         return .{ .alloc = alloc };
@@ -1236,6 +1250,8 @@ pub const ConversationTurnBuilder = struct {
         }
         self.steps.deinit(self.alloc);
         self.steering.deinit(self.alloc);
+        for (self.context_notes.items) |item| types.freePersistedContextNote(self.alloc, item);
+        self.context_notes.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -1245,7 +1261,8 @@ pub const ConversationTurnBuilder = struct {
             self.calls.items.len == 0 and
             self.results.items.len == 0 and
             self.steps.items.len == 0 and
-            self.steering.items.len == 0;
+            self.steering.items.len == 0 and
+            self.context_notes.items.len == 0;
     }
 
     pub fn begin(
@@ -1408,6 +1425,25 @@ pub const ConversationTurnBuilder = struct {
         self.pending_assistant = null;
     }
 
+    /// A note sits at a step boundary: after the user's message or a step's
+    /// last result, and before any steering or assistant text there (D93).
+    pub fn appendContextNote(self: *ConversationTurnBuilder, text: []const u8, sources: []const types.ContextNoteSource) !void {
+        if (self.user == null or self.calls.items.len != 0 or self.results.items.len != 0) {
+            return error.InvalidConversationFrame;
+        }
+        if (self.pending_replay != null) try self.finishStep();
+        if (self.pending_assistant != null) return error.InvalidConversationFrame;
+        const owned = try self.alloc.dupe(u8, text);
+        errdefer mem_utils.free(self.alloc, owned);
+        const owned_sources = try types.dupeNoteSources(self.alloc, sources);
+        errdefer types.freeNoteSources(self.alloc, owned_sources);
+        try self.context_notes.append(self.alloc, .{
+            .text = owned,
+            .after_tool_step_count = self.steps.items.len,
+            .sources = owned_sources,
+        });
+    }
+
     pub fn finishAssistant(
         self: *ConversationTurnBuilder,
         completed: session_event.ConversationTurnCompleted,
@@ -1515,11 +1551,14 @@ pub const ConversationTurnBuilder = struct {
         errdefer types.freeToolExecutionSteps(self.alloc, steps);
         const steering = try self.steering.toOwnedSlice(self.alloc);
         errdefer types.freePersistedSteering(self.alloc, steering);
+        const context_notes = try self.context_notes.toOwnedSlice(self.alloc);
+        errdefer types.freePersistedContextNotes(self.alloc, context_notes);
         const files = try types.dupeFileEvidenceSlice(self.alloc, files_source);
         return .{
             .tool_steps = steps,
             .files = files,
             .steering = steering,
+            .context_notes = context_notes,
             .turn_summary = turn_summary,
         };
     }

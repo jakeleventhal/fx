@@ -1319,6 +1319,24 @@ pub const PersistedSteering = struct {
     after_tool_step_count: usize,
 };
 
+/// An instruction file a context note delivered: its absolute path and a
+/// stamp of the file's metadata when fx delivered it. A stamp is never 0; 0
+/// means fx could not read it, so the stamp matches no file (D93).
+pub const ContextNoteSource = struct {
+    path: []const u8,
+    stamp: u64,
+};
+
+/// A system note fx added to the turn after its latest message, saved at the
+/// tool step boundary where the turn took it (D93). Owns `text`, `sources`,
+/// and each source path, so a later turn can count an unchanged file as
+/// delivered without reading the text.
+pub const PersistedContextNote = struct {
+    text: []u8,
+    after_tool_step_count: usize,
+    sources: []ContextNoteSource = &.{},
+};
+
 pub const SteeringDelivery = enum(u8) { queued, applied, not_applied };
 
 pub const FileEvidence = struct {
@@ -1337,10 +1355,13 @@ pub const ExecutionMemory = struct {
     files: []FileEvidence = &.{},
     /// User guidance consumed between model steps, with its chronological tool boundary.
     steering: []PersistedSteering = &.{},
+    /// Context notes the turn took, in order. At one boundary they come
+    /// before that boundary's steering.
+    context_notes: []PersistedContextNote = &.{},
     turn_summary: ?TurnSummary = null,
 
     pub fn isEmpty(self: ExecutionMemory) bool {
-        return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0;
+        return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0 and self.context_notes.len == 0;
     }
 };
 
@@ -1610,6 +1631,12 @@ pub const ChatMessage = struct {
     permission_feedback: bool = false,
     /// Checkpoint steering text has already had its envelope removed.
     restored_steering: bool = false,
+    /// A `.system` message fx added after the conversation started, which
+    /// only the messages lane carries (D93). Plain text content only.
+    context_note: bool = false,
+    /// The instruction files a context note delivers. Borrowed; never sent
+    /// to a provider.
+    context_note_sources: []const ContextNoteSource = &.{},
     // Source provenance for compaction, never permission authority.
     context_origin: enum { ordinary, user_turn, handoff } = .ordinary,
     standalone_response: bool = false,
@@ -2740,10 +2767,13 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     const files = try dupeFileEvidenceSlice(alloc, memory.files);
     errdefer freeFileEvidenceSlice(alloc, files);
     const steering = try dupePersistedSteering(alloc, memory.steering);
+    errdefer freePersistedSteering(alloc, steering);
+    const context_notes = try dupePersistedContextNotes(alloc, memory.context_notes);
     return .{
         .tool_steps = tool_steps,
         .files = files,
         .steering = steering,
+        .context_notes = context_notes,
         .turn_summary = memory.turn_summary,
     };
 }
@@ -2752,6 +2782,59 @@ pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) vo
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
     freePersistedSteering(alloc, memory.steering);
+    freePersistedContextNotes(alloc, memory.context_notes);
+}
+
+/// Caller owns the result; free it with `freePersistedContextNotes`.
+fn dupePersistedContextNotes(
+    alloc: std.mem.Allocator,
+    notes: []const PersistedContextNote,
+) ![]PersistedContextNote {
+    if (notes.len == 0) return &.{};
+    const copy = try alloc.alloc(PersistedContextNote, notes.len);
+    errdefer alloc.free(copy);
+    var copied: usize = 0;
+    errdefer for (copy[0..copied]) |item| alloc.free(item.text);
+    for (notes, copy) |item, *dest| {
+        const text = try alloc.dupe(u8, item.text);
+        errdefer alloc.free(text);
+        dest.* = .{
+            .text = text,
+            .after_tool_step_count = item.after_tool_step_count,
+            .sources = try dupeNoteSources(alloc, item.sources),
+        };
+        copied += 1;
+    }
+    return copy;
+}
+
+/// Caller owns the result; free it with `freeNoteSources`.
+pub fn dupeNoteSources(alloc: std.mem.Allocator, sources: []const ContextNoteSource) ![]ContextNoteSource {
+    if (sources.len == 0) return &.{};
+    const copy = try alloc.alloc(ContextNoteSource, sources.len);
+    errdefer alloc.free(copy);
+    var copied: usize = 0;
+    errdefer for (copy[0..copied]) |source| alloc.free(source.path);
+    for (sources, copy) |source, *dest| {
+        dest.* = .{ .path = try alloc.dupe(u8, source.path), .stamp = source.stamp };
+        copied += 1;
+    }
+    return copy;
+}
+
+pub fn freeNoteSources(alloc: std.mem.Allocator, sources: []const ContextNoteSource) void {
+    for (sources) |source| alloc.free(source.path);
+    if (sources.len > 0) alloc.free(sources);
+}
+
+pub fn freePersistedContextNotes(alloc: std.mem.Allocator, notes: []PersistedContextNote) void {
+    for (notes) |item| freePersistedContextNote(alloc, item);
+    if (notes.len > 0) alloc.free(notes);
+}
+
+pub fn freePersistedContextNote(alloc: std.mem.Allocator, note: PersistedContextNote) void {
+    alloc.free(note.text);
+    freeNoteSources(alloc, note.sources);
 }
 
 pub fn dupePersistedSteering(

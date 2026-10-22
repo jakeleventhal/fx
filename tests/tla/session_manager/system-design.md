@@ -306,9 +306,10 @@ manager:
 - **Item types and data:** each completed piece is one `item`, and its
   `data` comes from v1's piece codec (`encodeConversationFrame`,
   `src/core/session/session_event.zig` lines 439 to 482). The types are
-  `user`, `assistant`, `tool_call`, `tool_result`, `steering`, `turn_end`
-  (files and turn summary), `interruption` (reason detail, partial text,
-  command refs, origin), `recovery` and `continues`.
+  `user`, `assistant`, `tool_call`, `tool_result`, `steering`,
+  `context_note` (D93), `turn_end` (files and turn summary), `interruption`
+  (reason detail, partial text, command refs, origin), `recovery` and
+  `continues`.
 - **Recovery:** the agent loop's checkpoint becomes a small `recovery` item
   (cause, action, tool state, attempts, route, partial text). The pieces it
   used to copy are already in the log (D10).
@@ -1586,6 +1587,65 @@ only by quitting):
   harness can read afterwards. **Alternative:** put each reply's counts on
   its `assistant` item, which a reply with no text and no provider replay
   does not write.
+
+Settled for context notes (2026-10-22, to add context mid-session without
+rewriting a cached prompt prefix):
+- **D93 Decision:** a context note is a system message fx adds to a turn
+  after its latest message, such as the scoped rules a tool call reaches,
+  a changed git branch, or a skill's note. Each note is its own
+  `context_note` item, whose `data` is the note's text, like `steering`,
+  and the instruction files it delivered, each with a stamp of the file's
+  size, modification time and inode.
+  - **Position:** a note sits at a step boundary, right after the user's
+    message or after the last result of a step, never inside a step's
+    results. At one boundary the turn's notes come before its steering, so
+    fx adds a note there only before it places that boundary's steering.
+    The item is written at that boundary, and a resume rebuilds the note
+    there as a flagged system message, so a resumed turn sends the messages
+    the live turn sent. When notes follow the last step, the file context
+    a saved turn adds comes after the turn's answer, because the live turn
+    sent those notes right before it.
+  - **Sent order:** Claude reads a conversation differently from the
+    instructions on when a system message comes right before a user
+    message, so the cache misses for the whole conversation. fx sends each
+    note after the user messages that directly follow it, such as steering
+    at its boundary or the next turn's message
+    (`src/core/agent/stream_provider.zig` placeContextNotes), the same way
+    for a live and a resumed turn. The saved order does not change.
+  - **Delivered rules:** on a route that takes notes, a turn counts each
+    file a saved note delivered as delivered while its stamp still matches,
+    so a tool call that reaches it again does not deliver it again. The next
+    delivery of a changed file says it replaces the earlier copy. A deleted
+    file's rules stay in the conversation until compaction. fx rebuilds
+    rules from earlier tool calls into the instructions only on routes
+    without notes.
+  - **Older fx:** an fx from before D93 does not know the type and leaves
+    the item out (D17), so it reads the turn without the note.
+  - **libfx and ACP saved state:** the execution JSON in
+    `session_codec.zig` names notes only in schema version 11, written only
+    for a turn that has notes; a turn without them keeps version 10 and its
+    bytes. An older fx rejects version 11, as it rejects every newer
+    version.
+  - **Compaction:** notes in turns a summary covers go with them. In the
+    first kept turn, the notes before the cut's step boundary go, and so do
+    the notes at that boundary when the cut also covers steering there,
+    which follows them; the rest count from the cut, as steering does
+    (D87). The `compacted` line keeps only `keep_tool_steps` and
+    `keep_steering`: the notes the cut covers follow from those. The
+    summarizer reads no notes.
+  - **Who gets them:** only the Gateway sends notes, and only to the
+    families it sends cache markers to: Anthropic models, and OpenAI
+    GPT-5.6 and later. A request to any other model or provider leaves the
+    notes out, and the trace log says how many and why. ACP clients never
+    see them replayed.
+
+  **Why:** text that changes during a session, added to the instructions,
+  rewrites the cached prefix of every request after it. A note after the
+  latest message leaves that prefix as it was, and saving it where it was
+  sent keeps the next request, and a resumed one, the same as the last.
+  **Alternative:** put the note in a user message, which the model reads
+  as the user's words; or keep notes only in memory, so a resume sends a
+  different request and loses the cache.
 
 ## Design Risks And Failure Behavior
 
