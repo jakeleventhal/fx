@@ -5535,6 +5535,7 @@ fn prepareSkillCatalog(
         config.skill_catalog.diagnostics,
         config.context_limits,
         context_window,
+        config.workspace_root,
     );
     errdefer section.deinit(alloc);
     if (section.notice) |notice| try deps.pushContextNotice(notice);

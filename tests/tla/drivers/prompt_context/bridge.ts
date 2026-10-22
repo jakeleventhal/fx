@@ -30,7 +30,7 @@ export type Family = "anthropic" | "openai";
 export type Verdict = "ACCEPTED" | "REJECTED" | "INCONCLUSIVE" | "TOOL_ERROR";
 export type PropertyVerdict = "HOLDS" | "VIOLATED" | "TOOL_ERROR";
 
-export const PROPERTIES = ["Budget", "SessionReuse", "CrossRepoReuse", "SameWorktreeReuse", "ContextChangeKeepsStable"] as const;
+export const PROPERTIES = ["Budget", "SessionReuse", "CrossRepoReuse", "SameWorktreeReuse", "WorktreeReuse", "ContextChangeKeepsStable"] as const;
 export type Property = (typeof PROPERTIES)[number];
 
 export interface Block { k: string; v: string }
@@ -232,7 +232,7 @@ export function observedModule(observed: ObservedRequest[]): string {
   ].join("\n");
 }
 
-interface Derived { first: boolean; prev: ObservedRequest | null; changed: boolean; worktreeSeen: boolean; worktreeCtxChanged: boolean; anySeen: boolean }
+interface Derived { first: boolean; prev: ObservedRequest | null; changed: boolean; worktreeSeen: boolean; worktreeCtxChanged: boolean; repoSeen: boolean; anySeen: boolean }
 
 /** The same derivations PromptCacheTrace makes, for coverage and the timeline. */
 export function derive(observed: ObservedRequest[]): Derived[] {
@@ -248,6 +248,7 @@ export function derive(observed: ObservedRequest[]): Derived[] {
       changed: prev !== null && ctx(prev) !== ctx(o),
       worktreeSeen: sameWorktree.length > 0,
       worktreeCtxChanged: sameWorktree.length > 0 && ctx(sameWorktree.at(-1)!) !== ctx(o),
+      repoSeen: earlier.some((e) => e.repo === o.repo),
       anySeen: n > 0,
     };
   });
@@ -261,6 +262,8 @@ export function coverage(observed: ObservedRequest[]): Record<Property, number> 
     SessionReuse: d.filter((x) => !x.first && !x.changed).length,
     CrossRepoReuse: d.filter((x, n) => x.first && x.anySeen && observed.slice(0, n).some((e) => e.w !== observed[n]!.w)).length,
     SameWorktreeReuse: d.filter((x) => x.first && x.worktreeCtxChanged).length,
+    // A new worktree of a repository that already ran.
+    WorktreeReuse: d.filter((x) => x.first && !x.worktreeSeen && x.repoSeen).length,
     ContextChangeKeepsStable: d.filter((x) => x.changed).length,
   };
 }

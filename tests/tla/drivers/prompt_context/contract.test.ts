@@ -47,11 +47,11 @@ const folder = (model: string) => {
 const EXPECTED: Record<Design, Record<string, string>> = {
   current: {
     Budget: "HOLDS", SessionReuse: "HOLDS", CrossRepoReuse: "VIOLATED",
-    SameWorktreeReuse: "VIOLATED", ContextChangeKeepsStable: "VIOLATED",
+    SameWorktreeReuse: "VIOLATED", WorktreeReuse: "VIOLATED", ContextChangeKeepsStable: "VIOLATED",
   },
   proposed: {
     Budget: "HOLDS", SessionReuse: "HOLDS", CrossRepoReuse: "HOLDS",
-    SameWorktreeReuse: "HOLDS", ContextChangeKeepsStable: "HOLDS",
+    SameWorktreeReuse: "HOLDS", WorktreeReuse: "HOLDS", ContextChangeKeepsStable: "HOLDS",
   },
 };
 

@@ -5204,7 +5204,10 @@ test "processQueuedPrompt prepares each origin skill catalog with its supplied m
             const entry = try scratch.allocator().print("- {s}: ", .{name});
             try std.testing.expect(std.mem.find(u8, catalog, entry) != null);
         }
-        try std.testing.expect(std.mem.find(u8, catalog, case.workspace) != null);
+        // Skills under the supplied workspace show relative to it; another
+        // origin's workspace would leave them absolute.
+        try std.testing.expect(std.mem.find(u8, catalog, "Root 0: skills\n") != null);
+        try std.testing.expect(std.mem.find(u8, catalog, case.workspace) == null);
         if (case.child) {
             try std.testing.expect(catalog.len < parent_catalog_bytes);
             try std.testing.expect(std.mem.find(u8, catalog, cases[0].workspace) == null);

@@ -72,6 +72,7 @@ Budget == PC!Budget
 SessionReuse == PC!SessionReuse
 CrossRepoReuse == PC!CrossRepoReuse
 SameWorktreeReuse == PC!SameWorktreeReuse
+WorktreeReuse == PC!WorktreeReuse
 ContextChangeKeepsStable == PC!ContextChangeKeepsStable
 
 ReplayIncomplete == i < Len(Observed)

@@ -399,38 +399,43 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
     if (global_rule != null or project_rule != null or selected.len > 0) {
         try appendSection(&out, "project-instructions-guidance", project_instruction_guidance);
     }
+    // The prompt shows workspace paths relative to the workspace root, so
+    // worktrees of one repository send the same text; records keep them absolute.
+    const root = options.workspace_root;
     if (global_rule) |rule| {
         const start = out.written().len;
-        try appendSectionFrom(&out, "global-rules", rule.source, rule.body);
-        try appendProjectInstructionLimitMarker(&out, &scratch, rule.source, rule.observed_bytes, options.context_limits.project_instruction_file_bytes);
+        try appendSectionFrom(&out, "global-rules", pathing.workspaceRelative(root, rule.source), rule.body);
+        try appendProjectInstructionLimitMarker(&out, &scratch, rule.source, pathing.workspaceRelative(root, rule.source), rule.observed_bytes, options.context_limits.project_instruction_file_bytes);
         try rendered_rules.append(arena, .{ .source = rule.source, .start = start, .end = out.written().len, .is_global = true });
     }
     for (selected) |candidate| {
         if (candidate.class == .ancestor) {
             const start = out.written().len;
-            try appendScopedSectionFrom(&out, candidate.source, candidate.scope, candidate.body.?);
-            try appendProjectInstructionLimitMarker(&out, &scratch, candidate.source, candidate.observed_bytes, options.context_limits.project_instruction_file_bytes);
+            try appendScopedSectionFrom(&out, pathing.workspaceRelative(root, candidate.source), pathing.workspaceRelative(root, candidate.scope), candidate.body.?);
+            try appendProjectInstructionLimitMarker(&out, &scratch, candidate.source, pathing.workspaceRelative(root, candidate.source), candidate.observed_bytes, options.context_limits.project_instruction_file_bytes);
             try rendered_rules.append(arena, .{ .source = candidate.source, .start = start, .end = out.written().len });
         }
     }
     if (project_rule) |rule| {
         const start = out.written().len;
-        try appendSectionFrom(&out, "project-rules", rule.source, rule.body);
-        try appendProjectInstructionLimitMarker(&out, &scratch, rule.source, rule.observed_bytes, options.context_limits.project_instruction_file_bytes);
+        try appendSectionFrom(&out, "project-rules", pathing.workspaceRelative(root, rule.source), rule.body);
+        try appendProjectInstructionLimitMarker(&out, &scratch, rule.source, pathing.workspaceRelative(root, rule.source), rule.observed_bytes, options.context_limits.project_instruction_file_bytes);
         try rendered_rules.append(arena, .{ .source = rule.source, .start = start, .end = out.written().len });
     }
     for (selected) |candidate| {
         if (candidate.class == .target) {
             const start = out.written().len;
-            try appendScopedSectionFrom(&out, candidate.source, candidate.scope, candidate.body.?);
-            try appendProjectInstructionLimitMarker(&out, &scratch, candidate.source, candidate.observed_bytes, options.context_limits.project_instruction_file_bytes);
+            try appendScopedSectionFrom(&out, pathing.workspaceRelative(root, candidate.source), pathing.workspaceRelative(root, candidate.scope), candidate.body.?);
+            try appendProjectInstructionLimitMarker(&out, &scratch, candidate.source, pathing.workspaceRelative(root, candidate.source), candidate.observed_bytes, options.context_limits.project_instruction_file_bytes);
             try rendered_rules.append(arena, .{ .source = candidate.source, .start = start, .end = out.written().len });
         }
     }
 
     sort_utils.sort(context_contract.ContextOmissionInput, scratch.omissions.items, {}, omissionLessThan);
     for (scratch.omissions.items) |omission| {
-        try appendOmission(&out, omission);
+        var shown = omission;
+        shown.source = pathing.workspaceRelative(root, omission.source);
+        try appendOmission(&out, shown);
     }
     if (scratch.omission_summary.omitted_count > 0) try appendOmissionSummary(&out, &scratch);
     try appendOmissionSummaryNotice(&scratch);
@@ -963,17 +968,19 @@ fn writeOmissionRepair(writer: *std.Io.Writer, reason: context_contract.Omission
     }
 }
 
+/// `model_source` is the path the prompt shows; the user notice names `source`.
 fn appendProjectInstructionLimitMarker(
     out: *std.Io.Writer.Allocating,
     scratch: *SelectionScratch,
     source: []const u8,
+    model_source: []const u8,
     observed_bytes: usize,
     limit: context_limits.Resolved,
 ) !void {
     if (observed_bytes <= limit.effectiveBytes()) return;
     if (out.written().len > 0) try out.writer.writeAll("\n\n");
     try out.writer.writeAll("<context_limit name=\"project_instruction_file_bytes\" action=\"truncated\" source_file=\"");
-    try model_context_encoding.writeScalar(&out.writer, source);
+    try model_context_encoding.writeScalar(&out.writer, model_source);
     try out.writer.print(
         "\" observed_bytes=\"{d}\" effective_bytes=\"{d}\" source=\"{s}\" override=\"--context-limit project_instruction_file_bytes=BYTES|off\" />",
         .{ observed_bytes, limit.effectiveBytes(), limit.source.label() },
@@ -1339,7 +1346,7 @@ test "project instruction limit notices encode untrusted source paths" {
     defer out.deinit();
     const limit = context_limits.Resolved{ .value = .{ .bytes = 4 }, .source = .command_line };
 
-    try appendProjectInstructionLimitMarker(&out, &scratch, "bad\"\x1b\nAGENTS.md", 20, limit);
+    try appendProjectInstructionLimitMarker(&out, &scratch, "bad\"\x1b\nAGENTS.md", "bad\"\x1b\nAGENTS.md", 20, limit);
 
     try std.testing.expectEqual(@as(usize, 1), scratch.notices.items.len);
     try std.testing.expect(std.mem.find(u8, scratch.notices.items[0], "bad&quot;&#x1b;&#x0a;AGENTS.md") != null);
@@ -1500,7 +1507,7 @@ test "initial gather loads a contained AGENTS symlink with logical provenance" {
     defer context.deinit(alloc);
 
     try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), "LINKED_PROJECT_RULE") != null);
-    try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), logical_source) != null);
+    try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), "<project-rules from=\"AGENTS.md\">") != null);
     try std.testing.expectEqual(@as(usize, 1), context.delivered_sources.len);
     try std.testing.expectEqualStrings(logical_source, context.delivered_sources[0]);
     try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), "symlinked rule file") == null);
@@ -1966,7 +1973,7 @@ test "host instruction files deliver global and project rules from host paths" {
     const visible = context.modelVisibleBytes();
     try std.testing.expect(std.mem.startsWith(u8, visible, "<project-instructions-guidance>\n"));
     try std.testing.expect(std.mem.find(u8, visible, "<global-rules from=\"/home/visitor/.fx/AGENTS.md\">\nGLOBAL_HOST_RULE\n</global-rules>") != null);
-    try std.testing.expect(std.mem.find(u8, visible, "<project-rules from=\"/workspace/AGENTS.md\">\nPROJECT_HOST_RULE\n</project-rules>") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "<project-rules from=\"AGENTS.md\">\nPROJECT_HOST_RULE\n</project-rules>") != null);
     try std.testing.expect(std.mem.find(u8, visible, "home unavailable") == null);
     try std.testing.expectEqual(@as(usize, 2), context.delivered_sources.len);
     try std.testing.expectEqualStrings("/home/visitor/.fx/AGENTS.md", context.delivered_sources[0]);
@@ -1999,7 +2006,7 @@ test "host workspace without instruction file access reports the omission once" 
     defer context.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "<project-rules-omitted from=\"/workspace/AGENTS.md\" reason=\"host cannot read instruction files\" />",
+        "<project-rules-omitted from=\"AGENTS.md\" reason=\"host cannot read instruction files\" />",
         context.modelVisibleBytes(),
     );
     try std.testing.expectEqual(@as(usize, 1), context.notices.len);
@@ -2048,11 +2055,14 @@ test "host instruction reads apply the file limit and report truncation" {
 
     const visible = context.modelVisibleBytes();
     try std.testing.expectEqual(@as(usize, 15), FakeInstructionHost.last_max_bytes);
-    try std.testing.expect(std.mem.find(u8, visible, "<project-rules from=\"/workspace/AGENTS.md\">\nPROJECT-ONE\n</project-rules>") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "<project-rules from=\"AGENTS.md\">\nPROJECT-ONE\n</project-rules>") != null);
     try std.testing.expect(std.mem.find(u8, visible, "PROJECT-TWO") == null);
     try std.testing.expect(std.mem.find(u8, visible, "observed_bytes=\"24\" effective_bytes=\"12\"") != null);
     try std.testing.expectEqual(@as(usize, 1), context.notices.len);
     try std.testing.expect(std.mem.find(u8, context.notices[0], "effective=12 bytes") != null);
+    // The prompt names the file relative to the workspace; the user notice keeps the full path.
+    try std.testing.expect(std.mem.find(u8, visible, "source_file=\"AGENTS.md\"") != null);
+    try std.testing.expect(std.mem.find(u8, context.notices[0], "/workspace/AGENTS.md") != null);
 }
 
 test "host instruction read failures become explicit omissions" {
@@ -2076,7 +2086,7 @@ test "host instruction read failures become explicit omissions" {
         defer context.deinit(alloc);
 
         const visible = context.modelVisibleBytes();
-        try std.testing.expect(std.mem.find(u8, visible, "<project-rules-omitted from=\"/home/visitor/project/AGENTS.md\"") != null);
+        try std.testing.expect(std.mem.find(u8, visible, "<project-rules-omitted from=\"AGENTS.md\"") != null);
         try std.testing.expect(std.mem.find(u8, visible, case.reason) != null);
         try std.testing.expectEqual(@as(usize, 0), context.delivered_sources.len);
         try std.testing.expectEqual(@as(usize, 2), context.notices.len);
@@ -2148,7 +2158,7 @@ test "host instruction files load scoped rules for later targets" {
 
     try std.testing.expectEqualStrings(
         "<project-instructions-guidance>\n" ++ project_instruction_guidance ++ "\n</project-instructions-guidance>\n\n" ++
-            "<scoped-rules from=\"/workspace/src/AGENTS.md\" scope=\"/workspace/src\">\nSCOPED_HOST_RULE\n</scoped-rules>",
+            "<scoped-rules from=\"src/AGENTS.md\" scope=\"src\">\nSCOPED_HOST_RULE\n</scoped-rules>",
         later.modelVisibleBytes(),
     );
     try std.testing.expectEqual(@as(usize, 1), FakeInstructionHost.reads);

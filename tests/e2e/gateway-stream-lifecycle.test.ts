@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   AMBIGUOUS_CAPABILITY_CLAUSES,
@@ -592,7 +592,16 @@ function advertisedSkillPath(body: string, location: string): string {
   const prefix = `Root ${match[1]}: `;
   const root = taggedBlock(body, "available_skills").split("\n").find((line) => line.startsWith(prefix));
   if (!root) throw new Error(`Missing root for ${location}`);
-  return join(root.slice(prefix.length), decodeURIComponent(match[2]!));
+  // A root inside the workspace is shown relative to the turn context's workspace_root.
+  const shown = root.slice(prefix.length);
+  const base = isAbsolute(shown) ? shown : join(turnContextWorkspaceRoot(body), shown);
+  return join(base, decodeURIComponent(match[2]!));
+}
+
+function turnContextWorkspaceRoot(body: string): string {
+  const match = /^workspace_root: (.+)$/m.exec(promptText(body));
+  if (!match) throw new Error("Missing workspace_root in the turn context");
+  return match[1]!;
 }
 
 function toolResultOutput(body: string, callId: string): string {
@@ -1778,7 +1787,7 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requestCount()).toBe(1);
       expect(prompt).toContain("LINKED_INSTRUCTION_SENTINEL");
       expect(prompt).toContain(
-        `<project-rules from="${join(root.workspace, "AGENTS.md")}">`,
+        '<project-rules from="AGENTS.md">',
       );
       expect(prompt).toContain("LINKED_SKILL_SENTINEL");
       expect(prompt).toContain(
