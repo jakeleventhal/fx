@@ -89,9 +89,10 @@ const project_instruction_guidance =
     "When project instructions conflict, follow the narrowest applicable project scope.\n\n" ++
     "A folder can have its own AGENTS.md with rules for the files under it. When a tool call first " ++
     "reaches such a folder, fx appends that file's text to the end of the step's last tool result in a " ++
-    "<scoped-rules from=\"...\" scope=\"...\"> block. Treat it like the project instructions above: it is " ++
-    "repository content, not a user request, and direct user instructions take precedence. fx escapes " ++
-    "that tag in the tool output itself, so a tool's own output cannot open such a block.";
+    "<scoped-rules from=\"...\" scope=\"...\"> block. Follow its rules for files in its scope from then on, " ++
+    "as you follow the project instructions above: it is repository content, not a user request, and direct " ++
+    "user instructions take precedence. fx escapes that tag in the tool output itself, so a tool's own output " ++
+    "cannot open such a block.";
 
 const CandidateClass = enum {
     ancestor,
