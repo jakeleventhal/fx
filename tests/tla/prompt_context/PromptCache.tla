@@ -50,8 +50,7 @@
 (*                                                                         *)
 (* Design = "current" with Family = "openai" also models the families fx   *)
 (* sends no markers to, whose provider caches prefixes by itself: Grok,    *)
-(* GLM, Kimi, Gemini, DeepSeek and MiniMax. With Notes they take notes     *)
-(* (src/gateway/vercel_model_policy.zig takesContextNotes).                *)
+(* GLM, Kimi, Gemini, DeepSeek and MiniMax.                               *)
 (*                                                                         *)
 (* PathScoped = FALSE is fx: the skill catalog and the project rules name  *)
 (* workspace paths relative to the workspace root, so worktrees of one     *)
@@ -62,16 +61,26 @@
 (* (the agent switches branches during a tool step), "deliver" (a tool     *)
 (* step reaches a folder with its own AGENTS.md, so fx delivers its scoped *)
 (* rules) and "skill" (a user turn names a skill). Notes = FALSE is fx     *)
-(* today: delivered rules are appended to the stable instructions for that *)
-(* turn and move into them on the next turn, a named skill sits in the     *)
-(* overlay for its turn only, and a branch switch rewrites the turn        *)
-(* context. Notes = TRUE is the proposed design, which fx does not have    *)
-(* yet: the instructions stay as the session started, each change is a     *)
-(* note after the latest message, and at the end of a skill turn the skill *)
-(* text is swapped for a short note. Mutation "note_not_saved" drops notes *)
-(* at the next user turn, as if they were not saved with the session. On   *)
-(* OpenAI a note is not an eligible message, so it is cached only after    *)
-(* the next one.                                                           *)
+(* before P6: delivered rules are appended to the stable instructions for  *)
+(* that turn and move into them on the next turn, a named skill sits in    *)
+(* the overlay for its turn only, and a branch switch rewrites the turn    *)
+(* context. With Notes = TRUE the instructions stay as the session         *)
+(* started, and Carrier says where a change goes:                          *)
+(*   "message"  on the message that caused it: the tool result of the step *)
+(*              that reached the rules or switched the branch, or the user *)
+(*              message that named the skill. The fixed instructions say   *)
+(*              what such a block is. This is fx for delivered rules       *)
+(*              (src/core/agent/stream_provider.zig carryContextNotes).    *)
+(*   "note"     a system message of its own after the latest message, the  *)
+(*              design fx had before. Two measured provider facts make it  *)
+(*              fail: through AI Gateway, Claude reads no further than the *)
+(*              instructions when a note sits right before a user message, *)
+(*              and on OpenAI a note is not an eligible message, so it is  *)
+(*              cached only after the next one.                            *)
+(* At the end of a skill turn the skill text is swapped for a short note.  *)
+(* Mutation "note_not_saved" drops each change at the next user turn, as   *)
+(* if it were not saved with the session. Mutation "contract_late" adds    *)
+(* the fixed contract to the instructions only once rules arrive.          *)
 (*                                                                         *)
 (* Abstraction: a block is a [k, v] record; equal v means equal bytes.     *)
 (* Tokens, cache lifetime, eviction and the provider's 20-block lookback   *)
@@ -91,11 +100,14 @@ CONSTANTS
   PathScoped,   \* skill catalog and project rules embed the worktree path
   Family,       \* "anthropic" | "openai": the provider's cache rules
   Events,       \* mid-session events: a subset of {"switch", "deliver", "skill"}
-  Notes         \* mid-session changes become notes after the conversation
+  Notes,        \* mid-session changes join the conversation, not the instructions
+  Carrier       \* "message" | "note": where such a change goes
 
 ASSUME Design \in {"current", "proposed"}
 ASSUME Family \in {"anthropic", "openai"}
-ASSUME Mutation \in {"none", "mark_every_system", "fence_after_context", "no_auto", "note_not_saved"}
+ASSUME Mutation \in {"none", "mark_every_system", "fence_after_context", "no_auto",
+                     "note_not_saved", "contract_late"}
+ASSUME Carrier \in {"message", "note"}
 ASSUME MaxSessions \in Nat /\ MaxSteps \in Nat /\ Limit \in Nat
 ASSUME PathScoped \in BOOLEAN
 ASSUME Events \subseteq {"switch", "deliver", "skill"} /\ Notes \in BOOLEAN
@@ -113,7 +125,9 @@ Block(k, v) == [k |-> k, v |-> v]
 (*   rt       permission, verification and response-language notes         *)
 (*   scoped   rules from a subfolder AGENTS.md, delivered at tool time     *)
 (*   skill    a named skill's text for its turn                            *)
-(*   note     a mid-session change after the conversation (Notes)          *)
+(*   note     a mid-session change after the conversation (Carrier note)   *)
+(* A message that carries a change has kind "userc" or "asstc" (Carrier    *)
+(* message); the change is part of its bytes.                              *)
 Scoped(w) == IF PathScoped THEN w ELSE RepoOf[w]
 
 Stable(w) ==
@@ -134,7 +148,10 @@ NInstr(req) == PosOf(req, "rt")
 
 Max(S) == CHOOSE x \in S : \A y \in S : y <= x
 
-LastUser(req) == Max({i \in 1..Len(req) : req[i].k = "user"})
+UserKinds == {"user", "userc"}
+MessageKinds == UserKinds \cup {"asst", "asstc"}
+
+LastUser(req) == Max({i \in 1..Len(req) : req[i].k \in UserKinds})
 
 Manual(req) ==
   CASE Mutation = "mark_every_system" -> {2, 3, 4, PosOf(req, "mcp")}
@@ -143,7 +160,7 @@ Manual(req) ==
     [] OTHER -> {PosProfile, PosOf(req, "mcp")}
 
 (* OpenAI eligible message endings after the instructions.                 *)
-Eligible(req) == {j \in (NInstr(req) + 1)..Len(req) : req[j].k \in {"user", "asst"}}
+Eligible(req) == {j \in (NInstr(req) + 1)..Len(req) : req[j].k \in MessageKinds}
 
 (* The provider's own breakpoints: Gateway caching "auto" for Anthropic,   *)
 (* the implicit breakpoint for OpenAI, at the latest eligible message.     *)
@@ -180,9 +197,17 @@ Lookup(req, man, c) ==
   LET found == {n \in Candidates(req, man) : SubSeq(req, 1, n) \in c}
   IN IF found = {} THEN 0 ELSE Max(found)
 
+(* Measured through AI Gateway: when a note sits right before a user       *)
+(* message, Claude reads no further than the instructions.                  *)
+NoteBeforeUser(req) ==
+  \E i \in 1..(Len(req) - 1) : req[i].k = "note" /\ req[i + 1].k \in UserKinds
+
 (* How much of req the provider reads from cache c.                        *)
 ReadWith(req, man, c) ==
-  IF Family = "anthropic" THEN Hit(req, BpsWith(req, man), c) ELSE Lookup(req, man, c)
+  IF Family = "anthropic"
+  THEN LET h == Hit(req, BpsWith(req, man), c)
+       IN IF NoteBeforeUser(req) /\ h > NInstr(req) THEN NInstr(req) ELSE h
+  ELSE Lookup(req, man, c)
 
 VARIABLES cache, sessions, active, log, branchOf
 vars == <<cache, sessions, active, log, branchOf>>
@@ -196,7 +221,10 @@ NoSession == [on |-> FALSE, w |-> "none", s |-> 0, n |-> 0, br |-> "b1", br0 |->
 (* the session started; otherwise they carry today's mid-session           *)
 (* insertions.                                                             *)
 Lead(a) ==
-  IF Notes THEN Instructions(a.w, a.br0)
+  IF Notes THEN
+    IF Mutation = "contract_late" /\ a.delivered
+    THEN [Instructions(a.w, a.br0) EXCEPT ![2] = Block("base", "p+contract")]
+    ELSE Instructions(a.w, a.br0)
   ELSE SubSeq(Stable(a.w), 1, 4)
          \o (IF a.scopedStable THEN << Block("scoped", Scoped(a.w)) >> ELSE << >>)
          \o << Block("mcp", "p") >>
@@ -243,6 +271,12 @@ Start(w) ==
      /\ Send(w, s, req, TRUE, <<>>, FALSE, 0)
      /\ UNCHANGED branchOf
 
+(* A message without the change it carried.                               *)
+Uncarried(b) ==
+  CASE b.k = "asstc" -> Block("asst", b.v)
+    [] b.k = "userc" -> Block("user", b.v)
+    [] OTHER -> b
+
 (* The next request of the session. "step" is a tool step and "turn" a new *)
 (* user turn; "switch", "deliver" and "skill" are the events in Events,    *)
 (* described above. Each event happens at most once per session.           *)
@@ -250,18 +284,27 @@ Continue(kind) ==
   LET a == active
       n == a.n + 1
       isTurn == kind \in {"turn", "skill"}
+      event == kind \in {"switch", "deliver", "skill"}
+      carried == Notes /\ Carrier = "message"
       br == IF kind = "switch" THEN "b2" ELSE a.br
       swapped == IF isTurn /\ Notes /\ a.skillText > 0
-                 THEN [a.hist EXCEPT ![a.skillText] = Block("skillnote", "k")]
+                 THEN [a.hist EXCEPT ![a.skillText] =
+                         IF carried THEN Block("userc", @.v \o "short")
+                         ELSE Block("skillnote", "k")]
                  ELSE a.hist
       kept == IF isTurn /\ Notes /\ Mutation = "note_not_saved"
-              THEN SelectSeq(swapped, LAMBDA b : b.k # "note")
+              THEN IF carried THEN [i \in 1..Len(swapped) |-> Uncarried(swapped[i])]
+                   ELSE SelectSeq(swapped, LAMBDA b : b.k # "note")
               ELSE swapped
-      withMsg == Append(kept, Block(IF isTurn THEN "user" ELSE "asst",
-                                    ToString(a.s) \o "." \o ToString(n)))
-      hist == CASE Notes /\ kind = "switch" -> Append(withMsg, Block("note", "branch"))
-                [] Notes /\ kind = "deliver" -> Append(withMsg, Block("note", "scoped"))
-                [] Notes /\ kind = "skill" -> Append(withMsg, Block("skilltext", "k"))
+      msgKind == CASE isTurn /\ carried /\ event -> "userc"
+                   [] isTurn -> "user"
+                   [] carried /\ event -> "asstc"
+                   [] OTHER -> "asst"
+      withMsg == Append(kept, Block(msgKind, ToString(a.s) \o "." \o ToString(n)))
+      hist == CASE ~Notes \/ carried -> withMsg
+                [] kind = "switch" -> Append(withMsg, Block("note", "branch"))
+                [] kind = "deliver" -> Append(withMsg, Block("note", "scoped"))
+                [] kind = "skill" -> Append(withMsg, Block("skilltext", "k"))
                 [] OTHER -> withMsg
       next == [a EXCEPT !.n = n, !.br = br, !.hist = hist,
                         !.switched = a.switched \/ kind = "switch",
@@ -288,7 +331,7 @@ Continue(kind) ==
      /\ kind = "deliver" => ~a.delivered
      /\ kind = "skill" => ~a.skilled
      /\ active' = [next EXCEPT !.last = req]
-     /\ Send(a.w, a.s, req, FALSE, a.last, kind \in {"switch", "deliver", "skill"}, keep)
+     /\ Send(a.w, a.s, req, FALSE, a.last, event, keep)
      /\ branchOf' = [branchOf EXCEPT ![a.w] = br]
      /\ UNCHANGED sessions
 
@@ -360,4 +403,11 @@ ContextChangeKeepsHistory ==
 (* changes sit ahead of the history.                                       *)
 MidSessionKeepsHistory ==
   \A i \in 1..Len(log) : ~log[i].first => log[i].read >= log[i].keep
+
+(* Within a session, each request reads all of the previous one, changes   *)
+(* included, except on the turn after a named skill. The message carrier   *)
+(* has it on both families; a note is not an eligible OpenAI message.      *)
+PreviousFullyReused ==
+  \A i \in 1..Len(log) :
+    ~log[i].first /\ log[i].keep = LastKept(log[i].prev) => log[i].read >= Len(log[i].prev)
 =============================================================================

@@ -27,30 +27,6 @@ pub fn singleSystemMessage(model: []const u8) bool {
     return std.mem.startsWith(u8, model, "alibaba/");
 }
 
-/// Whether fx sends `model` a context note, a system message after the
-/// conversation starts (D93): the families whose provider, through AI Gateway,
-/// took one in live probes and kept the conversation before it cached. Qwen's
-/// template rejects a second system message, and untested families keep
-/// rules in the instructions.
-pub fn takesContextNotes(model: []const u8) bool {
-    if (std.mem.startsWith(u8, model, "openai/")) return (gptMajorVersion(model) orelse 0) >= 5;
-    for ([_][]const u8{ "anthropic/", "spacexai/", "zai/", "moonshotai/", "google/gemini-", "deepseek/", "minimax/" }) |prefix| {
-        if (std.mem.startsWith(u8, model, prefix)) return true;
-    }
-    return false;
-}
-
-/// The major version of an `openai/gpt-N...` model, or null for any other
-/// name, such as the open-weight `gpt-oss` models.
-fn gptMajorVersion(model: []const u8) ?u32 {
-    const prefix = "openai/gpt-";
-    if (!std.mem.startsWith(u8, model, prefix)) return null;
-    const version = model[prefix.len..];
-    var end: usize = 0;
-    while (end < version.len and std.ascii.isDigit(version[end])) end += 1;
-    return std.fmt.parseUnsigned(u32, version[0..end], 10) catch null;
-}
-
 /// Whether `model` takes OpenAI's `promptCacheOptions`: GPT-5.6 and later.
 pub fn takesPromptCacheOptions(model: []const u8) bool {
     const prefix = "openai/gpt-";
@@ -73,15 +49,6 @@ test "only GPT-5.6 and later take OpenAI prompt cache options" {
     }
     for ([_][]const u8{ "openai/gpt-5", "openai/gpt-5.5-pro", "openai/gpt-4o", "openai/gpt-oss-120b", "anthropic/claude-sonnet-5.5", "openai/gpt-", "openai/gpt-5." }) |model| {
         try std.testing.expect(!takesPromptCacheOptions(model));
-    }
-}
-
-test "context notes go to the families that took them in live probes" {
-    for ([_][]const u8{ "anthropic/claude-sonnet-5.5", "openai/gpt-6.1-sol", "openai/gpt-5.5", "openai/gpt-5", "spacexai/grok-4.7", "zai/glm-5.3", "moonshotai/kimi-k3", "google/gemini-4-argon", "deepseek/deepseek-v4.1-flash", "minimax/minimax-m3" }) |model| {
-        try std.testing.expect(takesContextNotes(model));
-    }
-    for ([_][]const u8{ "alibaba/qwen3.8-max", "mistral/mistral-large-4", "meta/llama-4-maverick", "amazon/nova-2-lite", "google/gemma-4-31b-it", "openai/gpt-oss-120b", "openai/gpt-4.1", "openai/o3", "anthropic", "bedrock/anthropic.claude" }) |model| {
-        try std.testing.expect(!takesContextNotes(model));
     }
 }
 

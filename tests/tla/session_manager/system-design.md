@@ -1590,9 +1590,9 @@ only by quitting):
 
 Settled for context notes (2026-10-22, to add context mid-session without
 rewriting a cached prompt prefix):
-- **D93 Decision:** a context note is a system message fx adds to a turn
-  after its latest message, such as the scoped rules a tool call reaches,
-  a changed git branch, or a skill's note. Each note is its own
+- **D93 Decision:** a context note is text fx adds to a turn after its
+  latest message, such as the scoped rules a tool call reaches, a changed
+  git branch, or a skill's note. Each note is its own
   `context_note` item, whose `data` is the note's text, like `steering`,
   and the instruction files it delivered, each with a stamp of the file's
   size, modification time and inode.
@@ -1602,23 +1602,30 @@ rewriting a cached prompt prefix):
     fx adds a note there only before it places that boundary's steering.
     The item is written at that boundary, and a resume rebuilds the note
     there as a flagged system message, so a resumed turn sends the messages
-    the live turn sent. When notes follow the last step, the file context
-    a saved turn adds comes after the turn's answer, because the live turn
-    sent those notes right before it.
-  - **Sent order:** Claude reads a conversation differently from the
-    instructions on when a system message comes right before a user
-    message, so the cache misses for the whole conversation. fx sends each
-    note after the user messages that directly follow it, such as steering
-    at its boundary or the next turn's message
-    (`src/core/agent/stream_provider.zig` placeContextNotes), the same way
-    for a live and a resumed turn. The saved order does not change.
-  - **Delivered rules:** on a route that takes notes, a turn counts each
-    file a saved note delivered as delivered while its stamp still matches,
-    so a tool call that reaches it again does not deliver it again. The next
-    delivery of a changed file says it replaces the earlier copy. A deleted
-    file's rules stay in the conversation until compaction. fx rebuilds
-    rules from earlier tool calls into the instructions only on routes
-    without notes.
+    the live turn sent.
+  - **Carrier:** no provider gets a note as a message of its own. Each
+    request appends a note to the end of the last tool result of its step,
+    past that step's permission feedback, the same way for a live and a
+    resumed turn (`src/core/agent/stream_provider.zig` carryContextNotes);
+    the saved order does not change. The session-start instructions always
+    say what such a block is and that the user's instructions come first
+    (`src/builtins/context.zig` project_instruction_guidance), so they do
+    not change when rules arrive. The same request escapes every
+    `<scoped-rules` and `</scoped-rules` in tool output, in any case, to
+    `&lt;`, so a tool's own output cannot open the block; the user's text
+    and the note are left as they are. A note with no tool result before it
+    is sent as a user message of its own; only a compaction that keeps a
+    note but not its step leaves one. With a system message instead,
+    providers each broke the cache differently: Claude when a user message
+    followed the note, Kimi when the note was last, and Qwen rejected it
+    (`tests/tla/prompt_context/PromptCache.tla` Carrier, p6-note-claude.cfg
+    and p6-note-openai.cfg).
+  - **Delivered rules:** a turn counts each file a saved note delivered as
+    delivered while its stamp still matches, so a tool call that reaches it
+    again does not deliver it again. The next delivery of a changed file
+    says it replaces the earlier copy. A deleted file's rules stay in the
+    conversation until compaction. fx no longer rebuilds rules from earlier
+    tool calls into the instructions.
   - **Older fx:** an fx from before D93 does not know the type and leaves
     the item out (D17), so it reads the turn without the note.
   - **libfx and ACP saved state:** the execution JSON in
@@ -1633,23 +1640,21 @@ rewriting a cached prompt prefix):
     (D87). The `compacted` line keeps only `keep_tool_steps` and
     `keep_steering`: the notes the cut covers follow from those. The
     summarizer reads no notes.
-  - **Who gets them:** only the Gateway sends notes, and only to the
-    families whose provider took one in live probes and kept the
-    conversation before it cached: Anthropic, OpenAI GPT-5 and later, Grok,
-    GLM, Kimi, Gemini, DeepSeek and MiniMax
-    (`src/gateway/vercel_model_policy.zig` takesContextNotes). Qwen's
-    template rejects a second system message, and untested families keep
-    rules in the instructions. A request to any other model or provider
-    leaves the notes out, and the trace log says how many and why. ACP
+  - **Who gets them:** every model and provider, libfx hosts included,
+    since a tool result is part of every provider's conversation. ACP
     clients never see them replayed.
 
   **Why:** text that changes during a session, added to the instructions,
-  rewrites the cached prefix of every request after it. A note after the
-  latest message leaves that prefix as it was, and saving it where it was
-  sent keeps the next request, and a resumed one, the same as the last.
-  **Alternative:** put the note in a user message, which the model reads
-  as the user's words; or keep notes only in memory, so a resume sends a
-  different request and loses the cache.
+  rewrites the cached prefix of every request after it. A note on the
+  newest tool result leaves that prefix as it was, and saving it where it
+  was sent keeps the next request, and a resumed one, the same as the last.
+  Live replays of ten model families followed the rules as well as with
+  the rules in the instructions, and read the whole conversation from the
+  cache.
+  **Alternative:** a system message after the latest message, which needs
+  a list of the models it works for; a user message of its own, which the
+  model reads as the user's words; or keep notes only in memory, so a
+  resume sends a different request and loses the cache.
 
 ## Design Risks And Failure Behavior
 

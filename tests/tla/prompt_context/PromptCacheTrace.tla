@@ -17,7 +17,7 @@
 (***************************************************************************)
 EXTENDS PromptCacheObserved, Naturals, Sequences, FiniteSets, TLC
 
-CONSTANTS Design, Family, Notes
+CONSTANTS Design, Family, Notes, Carrier
 
 VARIABLES i, cache, log
 vars == <<i, cache, log>>
@@ -31,10 +31,15 @@ Kinds == <<"tools", "base", "skills", "project", "mcp", "ctx", "rt">>
 
 Has(req, kind) == \E j \in 1..Len(req) : req[j].k = kind
 
-\* Blocks today's fx adds ahead of the history mid-session, and the blocks the
-\* notes design adds inside it.
+\* Blocks fx before P6 adds ahead of the history mid-session, and the blocks a
+\* note carrier adds inside it. With Carrier = "message" a change is part of
+\* the message that caused it, so no block of its own may appear.
 Inserted == {"scoped", "skill"}
 Noted == {"note", "skilltext", "skillnote"}
+ConversationKinds ==
+  CASE ~Notes -> {"user", "asst"}
+    [] Carrier = "message" -> PC!MessageKinds
+    [] OTHER -> {"user", "asst"} \cup Noted
 
 Layout(req) ==
   /\ Has(req, "rt")
@@ -44,9 +49,8 @@ Layout(req) ==
         /\ \A j \in 1..Len(Kinds) : base[j].k = Kinds[j]
         /\ Notes => Len(base) = Len(lead)
   /\ Len(req) > PC!NInstr(req)
-  /\ \A j \in (PC!NInstr(req) + 1)..Len(req) :
-       req[j].k \in {"user", "asst"} \cup (IF Notes THEN Noted ELSE {})
-  /\ \E j \in (PC!NInstr(req) + 1)..Len(req) : req[j].k = "user"
+  /\ \A j \in (PC!NInstr(req) + 1)..Len(req) : req[j].k \in ConversationKinds
+  /\ \E j \in (PC!NInstr(req) + 1)..Len(req) : req[j].k \in PC!UserKinds
 
 \* The request before n in the same session, or 0 for a session's first.
 Before(n) ==
@@ -98,6 +102,7 @@ WorktreeReuse == PC!WorktreeReuse
 ContextChangeKeepsStable == PC!ContextChangeKeepsStable
 ContextChangeKeepsHistory == PC!ContextChangeKeepsHistory
 MidSessionKeepsHistory == PC!MidSessionKeepsHistory
+PreviousFullyReused == PC!PreviousFullyReused
 
 ReplayIncomplete == i < Len(Observed)
 =============================================================================

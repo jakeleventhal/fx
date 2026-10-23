@@ -2045,7 +2045,8 @@ describe("gateway stream lifecycle", () => {
       expect(promptText(gateway.requests[0]!.body)).toContain(
         'reason="oversized rule file"',
       );
-      expect(promptText(gateway.requests[1]!.body)).toContain(
+      // Rules and omissions a tool call reaches ride on its result (D93).
+      expect(toolResultOutput(gateway.requests[1]!.body, "project_omission_read")).toContain(
         'reason="selection cap"',
       );
     } finally {
@@ -3530,8 +3531,13 @@ describe("gateway stream lifecycle", () => {
         expect(deferredBody).toContain(buildRule);
         expect(deferredBody).not.toContain(siblingRule);
         expect(deferredBody.indexOf(rootRule)).toBeLessThan(deferredBody.indexOf(buildRule));
-        expect(toolResultOutput(deferredBody, firstCallId)).toBe(
-          "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.",
+        // The deferred call's result carries the rules it waited for (D93).
+        const deferredResult = toolResultOutput(deferredBody, firstCallId);
+        expect(deferredResult.startsWith(
+          "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.\n\n",
+        )).toBe(true);
+        expect(deferredResult).toContain(
+          `<scoped-rules from="build/AGENTS.md" scope="build">\n${buildRule}\n</scoped-rules>`,
         );
         expect(existsSync(targetPath)).toBe(true);
 

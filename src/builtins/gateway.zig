@@ -149,7 +149,6 @@ pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .stream_fn = streamAgentCompletion,
     .build_request_fn = buildAgentRequestForProvider,
     .project_replay_fn = vercel_protocol.selectReplayParts,
-    .takes_context_notes_fn = vercel_model_policy.takesContextNotes,
 };
 
 pub const provider_bundle = provider_set.Bundle{
@@ -456,52 +455,47 @@ test "agent request builder sends stable cache markers in each family's syntax" 
     }
 }
 
-test "agent requests carry context notes only to the families that take them, without cache markers (D93)" {
+test "agent requests carry delivered rules in the tool result for every family, without cache markers (D93)" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const instructions = [_]shared_types.ChatMessage{.{ .role = .system, .content = "stable base", .cache_breakpoint = true }};
+    const calls = [_]shared_types.ToolCall{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"sub/notes.md\"}" }};
     const messages = [_]shared_types.ChatMessage{
         .{ .role = .user, .content = "question" },
-        .{ .role = .system, .content = "scoped rules", .context_note = true },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "notes", .tool_call_id = "call_1", .tool_name = "read_file" },
+        .{ .role = .system, .content = "<scoped-rules from=\"sub/AGENTS.md\" scope=\"sub\">tabs</scoped-rules>", .context_note = true },
     };
-    const note_json = "{\"role\":\"system\",\"content\":\"scoped rules\"}";
-    for ([_]struct { model: []const u8, takes: bool }{
-        .{ .model = "anthropic/claude-sonnet-5.5", .takes = true },
-        .{ .model = "openai/gpt-6.1-sol", .takes = true },
-        .{ .model = "openai/gpt-5", .takes = true },
-        .{ .model = "google/gemini-3-flash", .takes = true },
-        .{ .model = "alibaba/qwen3.8-max", .takes = false },
-        .{ .model = "meta/llama-4-maverick", .takes = false },
-    }) |case| {
-        const sent = try agent_stream_provider.contextNoteMessages(arena, case.model, &messages);
-        try std.testing.expectEqual(case.takes, sent.ptr == (&messages).ptr);
-        try std.testing.expectEqual(@as(usize, if (case.takes) 2 else 1), sent.len);
-        var options = resolveGatewayProviderOptions(case.model, .auto, false);
+    const sent = try agent_stream_provider_contract.carryContextNotes(arena, &messages);
+    const carried = "\"value\":\"notes\\n\\n<scoped-rules from=\\\"sub/AGENTS.md\\\" scope=\\\"sub\\\">tabs</scoped-rules>\"";
+    for ([_][]const u8{
+        "anthropic/claude-sonnet-5.5",
+        "openai/gpt-6.1-sol",
+        "openai/gpt-5",
+        "spacexai/grok-4.7",
+        "moonshotai/kimi-k3",
+        "alibaba/qwen3.8-max",
+        "meta/llama-4-maverick",
+    }) |model| {
+        var options = resolveGatewayProviderOptions(model, .auto, false);
         options.prompt_caching = true;
         const body = try buildAgentRequest(arena, .{
-            .model = case.model,
+            .model = model,
             .instructions = &instructions,
             .messages = sent,
             .tool_choice = .auto,
             .provider_options = options,
         });
-        // A kept note is a plain system message after the user's; a removed
-        // one leaves nothing behind.
-        try std.testing.expectEqual(case.takes, std.mem.find(u8, body, note_json) != null);
-        try std.testing.expectEqual(case.takes, std.mem.find(u8, body, "scoped rules") != null);
-        if (case.takes) try std.testing.expect(std.mem.find(u8, body, "question").? < std.mem.find(u8, body, note_json).?);
-        // Only the stable instructions carry a marker, for the families fx
-        // marks; a note never does.
-        const markers: usize = @intFromBool(vercel_model_policy.cacheMarkers(case.model) != .none);
+        // The rules end the tool result's text, and the instructions are the
+        // request's only system message.
+        try std.testing.expect(std.mem.find(u8, body, carried) != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"role\":\"system\""));
+        // Only the stable instructions carry a marker, for the families fx marks.
+        const markers: usize = @intFromBool(vercel_model_policy.cacheMarkers(model) != .none);
         try std.testing.expectEqual(markers, std.mem.count(u8, body, "\"cacheControl\"") + std.mem.count(u8, body, "\"promptCacheBreakpoint\""));
     }
-    // A provider that does not say it takes notes never gets one.
-    const other: agent_stream_provider_contract.Provider = .{ .stream_fn = agent_stream_provider.stream_fn };
-    try std.testing.expectEqual(@as(usize, 1), (try other.contextNoteMessages(arena, "anthropic/claude-sonnet-5.5", &messages)).len);
-    // Without notes, the request's messages are the caller's own.
-    try std.testing.expect((try other.contextNoteMessages(arena, "openai/gpt-5", messages[0..1])).ptr == (&messages).ptr);
 }
 
 test "agent requests to Qwen send the instructions as one system message" {

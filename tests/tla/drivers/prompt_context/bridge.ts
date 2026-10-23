@@ -3,7 +3,9 @@
 // 1. Each captured agent request becomes PromptCache blocks: the tools, then
 //    the stable instruction groups (base, skills, project, mcp), the turn
 //    context, the runtime notes, then one block per user message and per run
-//    of assistant and tool messages. A message-level or part-level marker in
+//    of assistant and tool messages; a run whose tool result carries a
+//    delivered <scoped-rules> block is "asstc", PromptCache's message carrier.
+//    A message-level or part-level marker in
 //    the run's family syntax marks the block it ends:
 //    providerOptions.anthropic.cacheControl for Anthropic,
 //    providerOptions.openai.promptCacheBreakpoint for OpenAI. Layout drift, a
@@ -32,7 +34,7 @@ export type PropertyVerdict = "HOLDS" | "VIOLATED" | "TOOL_ERROR";
 
 export const PROPERTIES = ["Budget", "SessionReuse", "CrossRepoReuse", "SameWorktreeReuse", "WorktreeReuse", "ContextChangeKeepsStable"] as const;
 /** Checked by midsession.test.ts on sessions with mid-session context changes. */
-export const MID_PROPERTIES = ["MidSessionKeepsHistory"] as const;
+export const MID_PROPERTIES = ["MidSessionKeepsHistory", "PreviousFullyReused"] as const;
 export type Property = (typeof PROPERTIES)[number] | (typeof MID_PROPERTIES)[number];
 
 export interface Block { k: string; v: string }
@@ -106,7 +108,7 @@ function hasMarker(message: any, family: Family): boolean {
   return false;
 }
 
-/** A system message inside the conversation, as the notes design sends it, or null. */
+/** A system message inside the conversation, as a note carrier sends it, or null. */
 function noteKind(content: string): "note" | "skilltext" | "skillnote" | null {
   if (content.startsWith("<fx-context-update>") || content.includes("<scoped-rules")) return "note";
   if (content.startsWith(SKILL_TEXT)) return "skilltext";
@@ -213,11 +215,13 @@ export function abstractRequest(body: string, family: Family): Abstraction {
       continue;
     }
     // One model response is one block: an assistant message and the tool
-    // results that follow it.
+    // results that follow it. Rules fx delivered ride on a tool result; an
+    // escaped tag (&lt;scoped-rules) in tool output is not a block.
     const last = blocks.at(-1)!;
-    if (last.k === "asst" && role !== "assistant") {
+    if ((last.k === "asst" || last.k === "asstc") && role !== "assistant") {
       sources.at(-1)!.push(i);
       last.v = short(sources.at(-1)!.map((m) => text(prompt[m])).join("\u0000"));
+      if (role === "tool" && text(prompt[i]).includes("<scoped-rules")) last.k = "asstc";
       if (marked.at(-1)) errors.push(`marker inside an assistant run (before message ${i})`);
       marked[marked.length - 1] = hasMarker(prompt[i], family);
     } else {
@@ -298,13 +302,17 @@ export function coverage(observed: ObservedRequest[]): Record<Property, number> 
     // A new worktree of a repository that already ran.
     WorktreeReuse: d.filter((x) => x.first && !x.worktreeSeen && x.repoSeen).length,
     ContextChangeKeepsStable: d.filter((x) => x.changed).length,
-    // A request at or after a mid-session change: inserted, noted or switched.
+    // A request at or after a mid-session change: inserted, noted, carried or switched.
     MidSessionKeepsHistory: d.filter((x, n) => !x.first && (x.changed ||
       [observed[n]!, x.prev!].some((r) => r.req.some((b) => MID_KINDS.has(b.k))))).length,
+    PreviousFullyReused: d.filter((x, n) => !x.first &&
+      [observed[n]!, x.prev!].some((r) => r.req.some((b) => MID_KINDS.has(b.k)))).length,
   };
 }
 
-const MID_KINDS = new Set(["scoped", "skill", "note", "skilltext", "skillnote"]);
+const MID_KINDS = new Set(["scoped", "skill", "note", "skilltext", "skillnote", "asstc", "userc"]);
+const USER_KINDS = new Set(["user", "userc"]);
+const MESSAGE_KINDS = new Set(["user", "userc", "asst", "asstc"]);
 
 export interface TimelineRow {
   seq: number; s: number; w: string; first: boolean; changed: boolean;
@@ -318,7 +326,7 @@ export function simulate(observed: ObservedRequest[], family: Family): TimelineR
   const d = derive(observed);
   return observed.map((o, n) => {
     const sorted = (xs: number[]) => [...new Set(xs)].sort((a, b) => a - b);
-    const lastUser = Math.max(...o.req.flatMap((b, j) => (b.k === "user" ? [j + 1] : [])));
+    const lastUser = Math.max(...o.req.flatMap((b, j) => (USER_KINDS.has(b.k) ? [j + 1] : [])));
     let bps: number[];
     let read = 0;
     if (family === "anthropic") {
@@ -329,7 +337,7 @@ export function simulate(observed: ObservedRequest[], family: Family): TimelineR
     } else {
       // PromptCache Lookup: only lookup candidates; the developer block end is written too.
       const instr = o.req.findIndex((b) => b.k === "rt") + 1;
-      const eligible = o.req.flatMap((b, j) => (j + 1 > instr && (b.k === "user" || b.k === "asst") ? [j + 1] : []));
+      const eligible = o.req.flatMap((b, j) => (j + 1 > instr && MESSAGE_KINDS.has(b.k) ? [j + 1] : []));
       bps = sorted([...o.manual, Math.max(instr, ...eligible)]);
       for (const m of sorted([...bps, ...eligible, instr])) if (cache.has(key(o.req, m))) read = m;
       for (const bp of [...bps, instr]) cache.add(key(o.req, bp));
@@ -342,7 +350,7 @@ export function timelineMarkdown(rows: TimelineRow[]): string {
   const lines = [
     "Diagnostic timeline, computed by bridge.ts simulate(); TLC gives the verdicts.",
     "Block order: tools, base, skills, project, mcp, turn context, runtime notes, then the conversation. Rules delivered",
-    "mid-session and a named skill's text add blocks before the turn context; the notes design adds them inside the conversation.",
+    "mid-session ride on the tool result that reached them (asstc); before P6 they and a named skill's text added blocks before the turn context.",
     "",
     "| request | session | worktree | first | context changed | blocks | manual markers | all markers | blocks read |",
     "|---|---|---|---|---|---|---|---|---|",
@@ -355,7 +363,8 @@ export function timelineMarkdown(rows: TimelineRow[]): string {
 }
 
 function cfg(design: Design, family: Family, notes: boolean, invariants: string[]): string {
-  return ["SPECIFICATION Spec", "CONSTANTS", `  Design = "${design}"`, `  Family = "${family}"`, `  Notes = ${notes ? "TRUE" : "FALSE"}`, "INVARIANTS",
+  return ["SPECIFICATION Spec", "CONSTANTS", `  Design = "${design}"`, `  Family = "${family}"`, `  Notes = ${notes ? "TRUE" : "FALSE"}`,
+    `  Carrier = "message"`, "INVARIANTS",
     ...invariants.map((x) => `  ${x}`), ""].join("\n");
 }
 
@@ -371,7 +380,7 @@ async function trace(dir: string, observed: ObservedRequest[], design: Design, f
  * each property on the same replay. Writes every TLC run under `reports`.
  */
 export interface CheckOptions {
-  /** PromptCache Notes: mid-session changes are notes after the conversation. */
+  /** PromptCache Notes with Carrier "message": mid-session changes ride on the message that caused them. */
   notes?: boolean;
   properties?: readonly Property[];
 }

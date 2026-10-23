@@ -2743,20 +2743,28 @@ fn expectSameInstructions(alloc: std.mem.Allocator, a: []const u8, b: []const u8
     for (first.items, second.items) |x, y| try std.testing.expectEqualStrings(x, y);
 }
 
-/// The request ends with a tool result and then a system note holding `rule`.
-fn expectNoteAfterResults(alloc: std.mem.Allocator, body: []const u8, rule: []const u8) !void {
+/// The request ends with a tool result whose text ends with a rules block
+/// holding `rule`, and no system message follows the instructions (D93).
+fn expectRulesOnLastToolResult(alloc: std.mem.Allocator, body: []const u8, rule: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
     const prompt = parsed.object.get("prompt").?.array.items;
-    try std.testing.expect(prompt.len >= 2);
-    const note = prompt[prompt.len - 1].object;
-    try std.testing.expectEqualStrings("system", note.get("role").?.string);
-    try std.testing.expect(std.mem.find(u8, note.get("content").?.string, rule) != null);
-    try std.testing.expectEqualStrings("tool", prompt[prompt.len - 2].object.get("role").?.string);
+    var in_conversation = false;
+    for (prompt) |message| {
+        const is_system = std.mem.eql(u8, message.object.get("role").?.string, "system");
+        if (!is_system) in_conversation = true;
+        try std.testing.expect(!(is_system and in_conversation));
+    }
+    const last = prompt[prompt.len - 1].object;
+    try std.testing.expectEqualStrings("tool", last.get("role").?.string);
+    const parts = last.get("content").?.array.items;
+    const output = parts[parts.len - 1].object.get("output").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.find(u8, output, rule) != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "</scoped-rules>"));
 }
 
-test "on a route that takes context notes, rules a tool call reaches follow its results and stay out of the instructions (D93)" {
+test "rules a tool call reaches ride on the step's tool result and stay out of the instructions, for every model (D93)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2771,8 +2779,8 @@ test "on a route that takes context notes, rules a tool call reaches follow its 
     const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Final" } };
     var fixture = PromptFixture{ .workspace_root = workspace };
 
-    // Turn 1: the rules follow the step's results as a note; the
-    // instructions stay as the first request sent them.
+    // Turn 1: the rules end the step's tool result; the instructions stay as
+    // the first request sent them.
     var first_gateway = FakeGateway.init(alloc, &completions);
     defer first_gateway.deinit();
     var first_hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -2785,7 +2793,7 @@ test "on a route that takes context notes, rules a tool call reaches follow its 
     try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), job);
     try std.testing.expectEqual(@as(usize, 2), first_gateway.request_bodies.items.len);
     try expectBodyNotContains(&first_gateway, 0, "NOTE_SCOPE_RULE");
-    try expectNoteAfterResults(alloc, first_gateway.request_bodies.items[1], "NOTE_SCOPE_RULE");
+    try expectRulesOnLastToolResult(alloc, first_gateway.request_bodies.items[1], "NOTE_SCOPE_RULE");
     try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], first_gateway.request_bodies.items[1]);
     // The saved turn keeps the note at its boundary, with the file it delivered.
     try std.testing.expectEqual(@as(usize, 1), first_hooks.history_turns.items.len);
@@ -2795,6 +2803,8 @@ test "on a route that takes context notes, rules a tool call reaches follow its 
     try std.testing.expectEqual(@as(usize, 1), saved.context_notes[0].sources.len);
     try std.testing.expectEqualStrings(rules_path, saved.context_notes[0].sources[0].path);
     try std.testing.expect(saved.context_notes[0].sources[0].stamp != 0);
+    // The note is only the rules; the instructions say how such a block works.
+    try std.testing.expect(std.mem.startsWith(u8, saved.context_notes[0].text, "<scoped-rules from=\""));
 
     // Turn 2: the instructions do not rebuild the rules from the saved call,
     // and a call that reaches the folder again does not deliver them again.
@@ -2829,11 +2839,11 @@ test "on a route that takes context notes, rules a tool call reaches follow its 
     try runFakePrompt(&third_gateway, &third_hooks, fixture.config(), job);
     try std.testing.expectEqual(@as(usize, 2), third_gateway.request_bodies.items.len);
     try expectBodyNotContains(&third_gateway, 0, "NOTE_SCOPE_RULE_EDITED");
-    try expectNoteAfterResults(alloc, third_gateway.request_bodies.items[1], "NOTE_SCOPE_RULE_EDITED");
-    try expectNoteAfterResults(alloc, third_gateway.request_bodies.items[1], "The rules below replace the earlier copy from the same file.");
+    try expectRulesOnLastToolResult(alloc, third_gateway.request_bodies.items[1], "NOTE_SCOPE_RULE_EDITED");
+    try expectRulesOnLastToolResult(alloc, third_gateway.request_bodies.items[1], "The rules below replace the earlier copy from the same file.");
     try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], third_gateway.request_bodies.items[1]);
 
-    // A route that takes no notes still adds the rules to the instructions.
+    // A model no live probe covered gets the rules the same way.
     var plain_gateway = FakeGateway.init(alloc, &completions);
     defer plain_gateway.deinit();
     var plain_hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -2845,14 +2855,9 @@ test "on a route that takes context notes, rules a tool call reaches follow its 
     plain_job.permission_mode = .auto;
     try runFakePrompt(&plain_gateway, &plain_hooks, fixture.config(), plain_job);
     try std.testing.expectEqual(@as(usize, 2), plain_gateway.request_bodies.items.len);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const instructions = try leadingSystemContents(arena_state.allocator(), plain_gateway.request_bodies.items[1]);
-    const in_instructions = for (instructions.items) |content| {
-        if (std.mem.find(u8, content, "NOTE_SCOPE_RULE") != null) break true;
-    } else false;
-    try std.testing.expect(in_instructions);
-    try std.testing.expectEqual(@as(usize, 0), plain_hooks.history_turns.items[0].assistant.execution.context_notes.len);
+    try expectRulesOnLastToolResult(alloc, plain_gateway.request_bodies.items[1], "NOTE_SCOPE_RULE");
+    try expectSameInstructions(alloc, plain_gateway.request_bodies.items[0], plain_gateway.request_bodies.items[1]);
+    try std.testing.expectEqual(@as(usize, 1), plain_hooks.history_turns.items[0].assistant.execution.context_notes.len);
 }
 
 test "modern parallel preparation validates and checks availability once" {
@@ -3324,41 +3329,6 @@ test "modern cancellation during later context selection stops before context or
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
 
-test "retained project context cancellation preserves an interrupted turn" {
-    const alloc = std.testing.allocator;
-    defer ApplicableContextDelta.reset("", null);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    const calls = [_]ToolCall{toolCall("prior_read", "read_file", "{\"path\":\"prior.txt\"}")};
-    const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls) }};
-    const history = [_]types.HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("prior") },
-        .assistant = @constCast("prior result"),
-        .execution = .{ .tool_steps = @constCast(&steps) },
-    } }};
-    var gateway = FakeGateway.init(alloc, &.{});
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.context_enabled = true;
-    hooks.context_registry = ApplicableContextDelta.registry;
-    var fixture = PromptFixture{ .workspace_root = workspace };
-    var job = fixture.job();
-    // Rebuilding rules from saved tool calls is for routes without notes (D93).
-    job.model = @constCast("meta/llama-4-maverick");
-    job.history = @constCast(&history);
-    ApplicableContextDelta.reset("", &fixture.cancel_flag);
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-    try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
-    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
-    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
-}
-
 test "retained project context leaves empty history host context unchanged" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "Final" }};
@@ -3371,96 +3341,6 @@ test "retained project context leaves empty history host context unchanged" {
     var fixture = PromptFixture{};
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
     try expectBodyContains(&gateway, 0, "HOST_ONLY_CONTEXT");
-}
-
-test "retained project context refreshes queued rules before a repeated shell call" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "nested");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/AGENTS.md", .data = "RETAINED_OLD_RULE" });
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    const nested = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "nested");
-    defer alloc.free(nested);
-    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
-    const calls = [_]ToolCall{toolCall("scoped_shell", "shell", "{\"action\":\"run\",\"command\":\"pwd\",\"cwd\":\"nested\"}")};
-    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Final" } };
-    var first_gateway = FakeGateway.init(alloc, &completions);
-    defer first_gateway.deinit();
-    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer first_hooks.deinit();
-    first_hooks.context_enabled = true;
-    first_hooks.context_registry = registry;
-    var fixture = PromptFixture{ .workspace_root = workspace };
-    // Rebuilding rules from saved tool calls is for routes without context
-    // notes; a route with notes keeps them in its saved notes (D93).
-    var first_job = fixture.job();
-    first_job.model = @constCast("meta/llama-4-maverick");
-    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), first_job);
-    try std.testing.expectEqual(@as(usize, 0), first_hooks.executed_names.items.len);
-    try expectBodyContains(&first_gateway, 1, types.context_deferred_tool_result_output);
-
-    var queued_snapshot = try registry.gatherDefaultSnapshot(alloc, .{
-        .workspace_root = workspace,
-        .targets = &.{.{ .path = nested, .kind = .directory }},
-    });
-    defer queued_snapshot.deinit(alloc);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/AGENTS.md", .data = "RETAINED_CURRENT_RULE" });
-    var job = first_job;
-    job.history = first_hooks.history_turns.items;
-    job.context_snapshot = queued_snapshot;
-    var second_gateway = FakeGateway.init(alloc, &completions);
-    defer second_gateway.deinit();
-    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer second_hooks.deinit();
-    second_hooks.context_enabled = true;
-    second_hooks.context_registry = registry;
-    second_hooks.static_context_text = queued_snapshot.modelVisibleBytes();
-    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), job);
-    try expectBodyContains(&second_gateway, 0, "RETAINED_CURRENT_RULE");
-    try expectBodyNotContains(&second_gateway, 0, "RETAINED_OLD_RULE");
-    try std.testing.expectEqual(@as(usize, 1), second_hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 1), second_hooks.permission_names.items.len);
-    try std.testing.expectEqual(@as(usize, 2), second_gateway.request_bodies.items.len);
-
-    const bare_final = [_]FakeCompletion{.{ .content = "Core context delivered" }};
-    var bare_gateway = FakeGateway.init(alloc, &bare_final);
-    defer bare_gateway.deinit();
-    var bare_hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer bare_hooks.deinit();
-    bare_hooks.context_enabled = true;
-    bare_hooks.context_registry = registry;
-    var bare_deps = bare_hooks.deps();
-    bare_deps.append_static_context = null;
-    bare_deps.agent_stream_provider = bare_gateway.provider();
-    var agent: @import("../agent.zig").Agent = .{};
-    defer agent.deinit(alloc);
-    try agent.restoreHistory(alloc, job.history);
-    try runtime_orchestrator.processAgentPrompt(&agent, &bare_deps, null, testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, workspace), fixture.config(), job);
-    try expectBodyContains(&bare_gateway, 0, "RETAINED_CURRENT_RULE");
-
-    try tmp.dir.deleteFile(std.testing.io, "nested/AGENTS.md");
-    const final = [_]FakeCompletion{.{ .content = "No stale rule" }};
-    var deleted_gateway = FakeGateway.init(alloc, &final);
-    defer deleted_gateway.deinit();
-    var deleted_hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer deleted_hooks.deinit();
-    deleted_hooks.context_enabled = true;
-    deleted_hooks.context_registry = registry;
-    deleted_hooks.static_context_text = queued_snapshot.modelVisibleBytes();
-    try runFakePrompt(&deleted_gateway, &deleted_hooks, fixture.config(), job);
-    try expectBodyNotContains(&deleted_gateway, 0, "RETAINED_OLD_RULE");
-    try expectBodyNotContains(&deleted_gateway, 0, "RETAINED_CURRENT_RULE");
-
-    var disabled_gateway = FakeGateway.init(alloc, &final);
-    defer disabled_gateway.deinit();
-    var disabled_hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer disabled_hooks.deinit();
-    disabled_hooks.static_context_text = "HOST_CONTEXT_UNCHANGED";
-    try runFakePrompt(&disabled_gateway, &disabled_hooks, fixture.config(), job);
-    try expectBodyContains(&disabled_gateway, 0, "HOST_CONTEXT_UNCHANGED");
-    try expectBodyNotContains(&disabled_gateway, 0, "RETAINED_OLD_RULE");
 }
 
 test "modern context delta defers effectful call exactly once" {

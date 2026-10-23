@@ -2216,6 +2216,7 @@ test "execution memory records each context note boundary, before that boundary'
     const alloc = std.testing.allocator;
     const session = @import("../../session/session.zig");
     const gateway = @import("../../../builtins/gateway.zig");
+    const agent_stream_provider = @import("../stream_provider.zig");
     const steering = try steeringMessage(alloc, "after first");
     defer alloc.free(steering);
     var first_calls = [_]ToolCall{toolCall("call_first", "shell", "{\"command\":\"ls\"}")};
@@ -2267,7 +2268,10 @@ test "execution memory records each context note boundary, before that boundary'
                 });
             }
         };
-        try std.testing.expectEqualStrings(try request.body(arena, model, sent), try request.body(arena, model, resumed));
+        // Every request carries its notes on their tool results first (D93).
+        const carried_sent = try agent_stream_provider.carryContextNotes(arena, sent);
+        const carried_resumed = try agent_stream_provider.carryContextNotes(arena, resumed);
+        try std.testing.expectEqualStrings(try request.body(arena, model, carried_sent), try request.body(arena, model, carried_resumed));
     }
 
     // A cut at the first boundary keeps that boundary's notes unless it

@@ -155,8 +155,8 @@ if (reads.join(",") !== "/home/visitor/.fx/AGENTS.md,/workspace/AGENTS.md") {
   throw new Error(`readable: unexpected readFile paths: ${reads.join(",")}`);
 }
 
-// A tool call makes later turns rebuild context from history; that rebuild
-// must use the host workspace root, not the WebAssembly process root.
+// A tool call must not change a later turn's rules. They name workspace files
+// relative to the host workspace root, not the WebAssembly process root.
 const toolTurn = { turns: 2, respond: (request) => (request === 1 ? shellCall("call-1", "pwd") : null) };
 const readableAfterTool = await systemTextsWith(workspaceWith(readRules), "readable-after-tool", toolTurn);
 const readableTurnTwo = readableAfterTool.at(-1);

@@ -2674,14 +2674,6 @@ pub const TestHooks = if (builtin.is_test) struct {
     pub var context_gate_commit: ?*const fn () Allocator.Error!void = null;
 } else struct {};
 
-/// Whether the route for `model` takes context notes (D93). Rules a tool call
-/// reaches then follow the conversation instead of joining the stable
-/// instructions, so the cached conversation stays as it was.
-fn routeTakesContextNotes(deps: *const AgentRuntimeDeps, model: []const u8) bool {
-    const takes = deps.agent_stream_provider.takes_context_notes_fn orelse return false;
-    return takes(model);
-}
-
 /// A stamp of an instruction file's size, modification time, and inode, so a
 /// later turn can tell whether the file changed since a note delivered it.
 /// Never 0; returns 0 when the file cannot be read (D93).
@@ -2791,26 +2783,6 @@ fn seedNoteSources(
         });
         if (!containsPath(replaced.items, source.path)) try replaced.append(arena, try arena.dupe(u8, source.path));
     };
-}
-
-fn commitSelectedContext(
-    arena: Allocator,
-    stable_prefix: *std.ArrayList(ChatMessage),
-    context_delivery_state: *context_contract.DeliveryState,
-    selected: *context_contract.ProviderContext,
-) Allocator.Error!void {
-    if (comptime builtin.is_test) {
-        if (TestHooks.context_gate_commit) |hook| try hook();
-    }
-    if (selected.content != null) try stable_prefix.ensureUnusedCapacity(arena, 1);
-    try context_delivery_state.commit(arena, selected);
-    if (selected.content) |content| {
-        stable_prefix.appendAssumeCapacity(.{
-            .role = .system,
-            .content = content,
-        });
-        selected.content = null;
-    }
 }
 
 fn candidateHasApplicableContextDelta(
@@ -5849,34 +5821,7 @@ fn processQueuedPromptInner(
             if (explicit_section.?.load_notice) |notice| try push_notice(deps.ctx, notice);
         }
     }
-    var reconstructed_context = reconstruct: while (true) {
-        const snapshot = reconstructProjectContext(arena, deps, config, job) catch |err| {
-            if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
-            if (try append_immediate_steering_after_cancel(deps, arena, &within_turn_suffix, turn_id, "")) continue :reconstruct;
-            runtime_telemetry.traceCancelObserved(finish_trace.ctx, false);
-            var terminal_materializing = false;
-            try runtime_interruption.persistInterruptedTurnOnce(
-                deps,
-                finalization,
-                job,
-                null,
-                null,
-                completed_tool_names.items,
-                &interrupted_persisted,
-                finish_trace.ctx,
-                within_turn_suffix.items,
-                null,
-                &terminal_materializing,
-            );
-            finish_trace.finish("interrupted");
-            return;
-        };
-        break :reconstruct snapshot;
-    };
-    defer if (reconstructed_context) |*snapshot| snapshot.deinit(arena);
-    var prepared_job = job;
-    if (reconstructed_context) |snapshot| prepared_job.context_snapshot = snapshot;
-    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, if (reconstructed_context) |snapshot| snapshot.modelVisibleBytes() else null, &stable_prefix);
+    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, &stable_prefix);
     const active_history = job.history;
     const history_messages_before = stable_prefix.items.len;
     const interrupted_turns = runtime_interruption.countInterruptedHistory(active_history);
@@ -5945,13 +5890,13 @@ fn processQueuedPromptInner(
         semantic_presentation,
         lifecycle,
         config,
-        prepared_job,
+        job,
         .{ .catalog = if (skill_section) |*section| section else null, .explicit = if (explicit_section) |*section| section else null },
         request_capabilities,
         finalization,
         arena,
         turn_id,
-        &stable_prefix,
+        stable_prefix.items,
         &history_messages,
         &within_turn_suffix,
         &overlay_arena_state,
@@ -6294,59 +6239,11 @@ fn commitContextCompaction(
     return deps.propagate_history_turn(deps.ctx, .{ .compacted_summary = summary });
 }
 
-fn reconstructProjectContext(
-    alloc: Allocator,
-    deps: *const AgentRuntimeDeps,
-    config: Config,
-    job: QueuedPrompt,
-) !?context_contract.GatheredContextSnapshot {
-    if (!deps.context_enabled) return null;
-    // On a route that takes notes, rules earlier tool calls reached are in the
-    // saved notes, so the stable instructions keep the session-start rules
-    // and do not change mid-session (D93).
-    if (routeTakesContextNotes(deps, job.model)) return null;
-    var retained = try tool_preparation.retainedContextTargets(
-        alloc,
-        job.history,
-        if (job.recovery_checkpoint) |checkpoint| checkpoint.execution else null,
-        config.workspace_root,
-        deps.tool_registry,
-        config.cancel_flag,
-    );
-    defer retained.deinit(alloc);
-    if (retained.items.len == 0) return null;
-    const registry = deps.context_registry orelse return error.ContextRegistryUnavailable;
-    var targets: std.ArrayList(context_contract.ApplicableTarget) = .empty;
-    defer targets.deinit(alloc);
-    const prior = job.context_snapshot.evaluated_endpoints;
-    for (prior[0..@min(prior.len, 128)]) |endpoint| {
-        try targets.append(alloc, .{ .path = endpoint, .kind = .directory });
-    }
-    const image_targets = try context_contract.applicableTargetsForImages(alloc, job.images);
-    defer if (image_targets.len > 0) alloc.free(image_targets);
-    try targets.appendSlice(alloc, image_targets[0..@min(image_targets.len, 32)]);
-    try targets.appendSlice(alloc, retained.items);
-    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    var snapshot = try registry.gatherDefaultSnapshot(alloc, .{
-        .workspace_root = config.workspace_root,
-        .access_scope = config.access_scope,
-        .targets = targets.items,
-        .bounded_reconstruction = true,
-        .context_limits = config.context_limits,
-    });
-    errdefer snapshot.deinit(alloc);
-    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    for (snapshot.notices) |notice| try deps.pushContextNotice(notice);
-    debug_trace.logf("context", "reconstructed retained_targets={d} delivered_sources={d} bytes={d}", .{ retained.items.len, snapshot.delivered_sources.len, snapshot.modelVisibleBytes().len });
-    return snapshot;
-}
-
 fn appendStablePromptContext(
     alloc: Allocator,
     deps: *const AgentRuntimeDeps,
     config: Config,
     skill_catalog_text: ?[]const u8,
-    project_context: ?[]const u8,
     messages: *std.ArrayList(ChatMessage),
 ) !void {
     const start = messages.items.len;
@@ -6363,12 +6260,9 @@ fn appendStablePromptContext(
     if (config.model_prompt_overlay) |overlay| {
         try messages.append(alloc, .{ .role = .system, .content = overlay });
     }
-    if (deps.append_static_context) |append| {
-        try append(deps.ctx, alloc, project_context, messages);
-    } else if (project_context) |content| {
-        const registry = deps.context_registry orelse return error.ContextRegistryUnavailable;
-        try registry.appendDefaultStatic(.{ .project_context = content }, alloc, messages);
-    }
+    // The session-start project rules; rules a tool call reaches later ride
+    // on its tool result instead (D93).
+    if (deps.append_static_context) |append| try append(deps.ctx, alloc, null, messages);
     // The skill catalog and project rules name workspace paths. A breakpoint
     // at the end of the stable instructions keeps them cached when only the
     // per-step turn context after them changes (PromptCache.tla
@@ -6908,7 +6802,7 @@ fn processQueuedPromptLoop(
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
     turn_id: u64,
-    stable_prefix_ptr: *std.ArrayList(ChatMessage),
+    stable_prefix: []const ChatMessage,
     history_messages_ptr: *std.ArrayList(ChatMessage),
     within_turn_suffix_ptr: *std.ArrayList(ChatMessage),
     overlay_arena_state: *std.heap.ArenaAllocator,
@@ -6925,8 +6819,6 @@ fn processQueuedPromptLoop(
     // The image route core's turn state. This loop is its shell: it runs each
     // effect `image_route.step` returns and feeds the result back.
     var image_route_state = image_route.step(.{}, .{ .turn_started = request_capabilities.image_input_support }).state;
-    var stable_prefix = stable_prefix_ptr.*;
-    defer stable_prefix_ptr.* = stable_prefix;
     const history_messages = history_messages_ptr.*;
     var within_turn_suffix = within_turn_suffix_ptr.*;
     defer within_turn_suffix_ptr.* = within_turn_suffix;
@@ -6959,11 +6851,10 @@ fn processQueuedPromptLoop(
     else
         .{};
     defer context_delivery_state.deinit(arena);
-    const take_context_notes = deps.context_enabled and routeTakesContextNotes(deps, job.model);
     // Files saved notes delivered that changed since; their current rules
     // are delivered again when a tool call reaches them.
     var replaced_note_sources: std.ArrayList([]const u8) = .empty;
-    if (take_context_notes) try seedNoteDeliveredSources(
+    if (deps.context_enabled) try seedNoteDeliveredSources(
         arena,
         &context_delivery_state,
         &replaced_note_sources,
@@ -7019,7 +6910,7 @@ fn processQueuedPromptLoop(
     var current_step_index: usize = 0;
     var last_tool_call_name: []const u8 = "none";
     var last_tool_call_id: []const u8 = "none";
-    var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
+    var last_gateway_message_count: usize = stable_prefix.len + history_messages.items.len + 1;
     var selected_dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
     try selected_dynamic_tools.ensureTotalCapacity(arena, config.initial_dynamic_tools.len);
     for (config.initial_dynamic_tools) |tool| {
@@ -7183,7 +7074,7 @@ fn processQueuedPromptLoop(
         );
         var provider_prompt = try build_provider_prompt_with_response_language_control(
             overlay_arena,
-            stable_prefix.items,
+            stable_prefix,
             ephemeral_overlay.items,
             history_messages.items,
             current_user_effective,
@@ -7202,7 +7093,7 @@ fn processQueuedPromptLoop(
             @intFromBool(initial_decision_pending);
         var current_user_message_index = provider_prompt.current_user_index;
         const response_language_hold_until_completion =
-            response_language_context_conflicts(response_language_expectation, stable_prefix.items) or
+            response_language_context_conflicts(response_language_expectation, stable_prefix) or
             response_language_context_conflicts(response_language_expectation, ephemeral_overlay.items) or
             response_language_context_conflicts(response_language_expectation, history_messages.items) or
             response_language_context_conflicts(response_language_expectation, within_turn_suffix.items);
@@ -7359,7 +7250,7 @@ fn processQueuedPromptLoop(
             }
             provider_prompt = try build_provider_prompt_with_response_language_control(
                 overlay_arena,
-                stable_prefix.items,
+                stable_prefix,
                 ephemeral_overlay.items,
                 history_messages.items,
                 current_user_effective,
@@ -7538,9 +7429,9 @@ fn processQueuedPromptLoop(
             // After the steering rewrap, which recognizes a parent's steering
             // by how its text starts.
             const located_messages = try image_attachments.noteAttachmentLocations(overlay_arena, steering_messages);
-            // The one place a request loses the context notes its route does
-            // not take, before anything measures, observes, or sends it (D93).
-            const noted_messages = try deps.agent_stream_provider.contextNoteMessages(overlay_arena, gateway_model, located_messages);
+            // The one place context notes join their tool results, before
+            // anything measures, observes, or sends the request (D93).
+            const noted_messages = try agent_stream_provider.carryContextNotes(overlay_arena, located_messages);
             const request_messages = try with_replyable_conversation_tail(overlay_arena, noted_messages);
             if (request_messages.ptr != noted_messages.ptr) {
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{noted_messages.len});
@@ -10195,10 +10086,7 @@ fn processQueuedPromptLoop(
                 return;
             }
 
-            (if (take_context_notes)
-                commitContextNote(arena, &pending_context_notes, &context_delivery_state, &selected, replaced_note_sources.items)
-            else
-                commitSelectedContext(arena, &stable_prefix, &context_delivery_state, &selected)) catch |err| {
+            commitContextNote(arena, &pending_context_notes, &context_delivery_state, &selected, replaced_note_sources.items) catch |err| {
                 return settleFailedContextGate(
                     deps,
                     &stream_ctx.provisional_statuses,

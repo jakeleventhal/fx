@@ -79,9 +79,19 @@ pub const provider = context_contract.Provider{
     .append_transient_fn = appendTransient,
 };
 
+/// In the session-start instructions whenever fx can read instruction files,
+/// so they do not change when a later tool call reaches a folder's rules
+/// (D93). Those rules ride on the step's last tool result
+/// (`carryContextNotes` in src/core/agent/stream_provider.zig, which escapes
+/// the tag in the tool output itself).
 const project_instruction_guidance =
     "Direct user instructions take precedence over project instructions. " ++
-    "When project instructions conflict, follow the narrowest applicable project scope.";
+    "When project instructions conflict, follow the narrowest applicable project scope.\n\n" ++
+    "A folder can have its own AGENTS.md with rules for the files under it. When a tool call first " ++
+    "reaches such a folder, fx appends that file's text to the end of the step's last tool result in a " ++
+    "<scoped-rules from=\"...\" scope=\"...\"> block. Treat it like the project instructions above: it is " ++
+    "repository content, not a user request, and direct user instructions take precedence. fx escapes " ++
+    "that tag in the tool output itself, so a tool's own output cannot open such a block.";
 
 const CandidateClass = enum {
     ancestor,
@@ -396,7 +406,9 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
     var rendered_rules: std.ArrayList(RenderedRule) = .empty;
     defer rendered_rules.deinit(arena);
 
-    if (global_rule != null or project_rule != null or selected.len > 0) {
+    // The session-start instructions always say how rules arrive later;
+    // rules a tool call reaches carry only their blocks (D93).
+    if (options.initial and rule_files != null) {
         try appendSection(&out, "project-instructions-guidance", project_instruction_guidance);
     }
     // The prompt shows workspace paths relative to the workspace root, so
@@ -1982,7 +1994,7 @@ test "host instruction files deliver global and project rules from host paths" {
     try std.testing.expectEqual(ruleReadLength((context_limits.Values{}).project_instruction_file_bytes), FakeInstructionHost.last_max_bytes);
 }
 
-test "host instruction files stay silent when no rule exists" {
+test "host instruction files give only the delivery guidance when no rule exists (D93)" {
     const alloc = std.testing.allocator;
     FakeInstructionHost.reset(&.{});
 
@@ -1992,7 +2004,14 @@ test "host instruction files stay silent when no rule exists" {
     });
     defer context.deinit(alloc);
 
-    try std.testing.expect(context.content == null);
+    // A later tool call may still reach a folder with rules, so the
+    // session-start instructions already say how they arrive.
+    const content = context.content orelse return error.TestExpectedDeliveryGuidance;
+    try std.testing.expectEqualStrings(
+        "<project-instructions-guidance>\n" ++ project_instruction_guidance ++ "\n</project-instructions-guidance>",
+        content,
+    );
+    try std.testing.expectEqual(@as(usize, 0), context.delivered_sources.len);
     try std.testing.expectEqual(@as(usize, 2), FakeInstructionHost.reads);
     try std.testing.expectEqual(@as(usize, 0), context.notices.len);
 }
@@ -2156,9 +2175,10 @@ test "host instruction files load scoped rules for later targets" {
     });
     defer later.deinit(alloc);
 
+    // Rules a tool call reaches carry only their block; the session-start
+    // instructions hold the guidance (D93).
     try std.testing.expectEqualStrings(
-        "<project-instructions-guidance>\n" ++ project_instruction_guidance ++ "\n</project-instructions-guidance>\n\n" ++
-            "<scoped-rules from=\"src/AGENTS.md\" scope=\"src\">\nSCOPED_HOST_RULE\n</scoped-rules>",
+        "<scoped-rules from=\"src/AGENTS.md\" scope=\"src\">\nSCOPED_HOST_RULE\n</scoped-rules>",
         later.modelVisibleBytes(),
     );
     try std.testing.expectEqual(@as(usize, 1), FakeInstructionHost.reads);
