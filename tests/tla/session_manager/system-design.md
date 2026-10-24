@@ -307,9 +307,9 @@ manager:
   `data` comes from v1's piece codec (`encodeConversationFrame`,
   `src/core/session/session_event.zig` lines 439 to 482). The types are
   `user`, `assistant`, `tool_call`, `tool_result`, `steering`,
-  `context_note` (D93), `turn_end` (files and turn summary), `interruption`
-  (reason detail, partial text, command refs, origin), `recovery` and
-  `continues`.
+  `context_note` (D93), `runtime_context` (D94), `turn_end` (files and
+  turn summary), `interruption` (reason detail, partial text, command
+  refs, origin), `recovery` and `continues`.
 - **Recovery:** the agent loop's checkpoint becomes a small `recovery` item
   (cause, action, tool state, attempts, route, partial text). The pieces it
   used to copy are already in the log (D10).
@@ -1614,8 +1614,10 @@ rewriting a cached prompt prefix):
     `<scoped-rules` and `</scoped-rules` in tool output, in any case, to
     `&lt;`, so a tool's own output cannot open the block; the user's text
     and the note are left as they are. A note with no tool result before it
-    is sent as a user message of its own; only a compaction that keeps a
-    note but not its step leaves one. With a system message instead,
+    joins the user message right before it, such as the turn's own message
+    for a note at its start; after any other message, which only a
+    compaction that keeps a note but not its step leaves, it is sent as a
+    user message of its own. With a system message instead,
     providers each broke the cache differently: Claude when a user message
     followed the note, Kimi when the note was last, and Qwen rejected it
     (`tests/tla/prompt_context/PromptCache.tla` Carrier, p6-note-claude.cfg
@@ -1655,6 +1657,53 @@ rewriting a cached prompt prefix):
   a list of the models it works for; a user message of its own, which the
   model reads as the user's words; or keep notes only in memory, so a
   resume sends a different request and loses the cache.
+
+Settled for the runtime context (2026-10-24, so a changed branch, date or
+permission mode does not rewrite a cached prompt prefix):
+- **D94 Decision:** a session sends one runtime context ahead of the
+  history on every request: the system messages a host adds after the
+  stable instructions, such as the `<fx-turn-context>` block with its date
+  and git branch, the permission mode and the other runtime notes. The
+  turn that captures it saves it with that turn, and later turns, resumed
+  ones included, send that saved copy unchanged.
+  - **Capture:** the first step of a turn captures the host's runtime
+    context when no retained turn saved one, which is the session's first
+    turn and the first turn after a compaction summary. The turn's
+    `runtime_context` item comes right after its user message, and every
+    save of the turn carries it, so a streamed turn keeps the same prefix.
+    In the execution JSON it needs schema version 12, written only for that
+    turn.
+  - **Changes:** before each request fx compares the host's current runtime
+    context with what the model last saw: the newest update note in the
+    retained turns, or else the saved copy. When they differ, an update
+    note with the whole current runtime context, opened by
+    `<fx-context-update>`, becomes a context note (D93) at that step
+    boundary, before its steering. It rides on the turn's user message when
+    the change happened between turns, and on the tool result of the step
+    that made it otherwise. Tool output escapes the tag the way it escapes
+    `<scoped-rules` (`src/core/agent/stream_provider.zig` carryContextNotes).
+    The system prompt says what the block is and that its values replace
+    the runtime context from then on (`src/builtins/system_prompt.md`);
+    without that line, GPT-6.1 kept the instructions' permission mode.
+  - **Compaction:** a compaction summary ends the search, so the next turn
+    captures the current runtime context. An update kept after the summary
+    still counts as what the model last saw, so a turn whose new copy
+    differs from it adds one more update.
+  - **Older fx:** an fx from before D94 leaves the item out (D17) and
+    rebuilds the runtime context for every request, as it did.
+
+  **Why:** the runtime context sits ahead of the history, so any change to
+  it, a date rollover, a branch switch or a new permission mode, made the
+  next request read the whole conversation uncached. A saved copy keeps
+  those bytes the same for the session and its resumes, and the update
+  costs only its own tokens (`tests/tla/prompt_context/PromptCache.tla`
+  "outside", p6-mutant-overlay-rebuilt.cfg and
+  p6-mutant-overlay-not-saved.cfg).
+  **Alternative:** keep the runtime context only in memory, which a resume
+  or `fx ask --resume` rebuilds with new values; list only the changed
+  fields, which needs a parser for each runtime note; or move the runtime
+  context onto the first user message, which changes every session's
+  prompt for every model.
 
 ## Design Risks And Failure Behavior
 

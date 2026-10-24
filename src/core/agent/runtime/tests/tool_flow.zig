@@ -2994,6 +2994,88 @@ test "a resumed turn carries the stale shell handles note on its own message, no
     try std.testing.expectEqual(@as(usize, 0), second_hooks.history_turns.items[0].assistant.execution.context_notes.len);
 }
 
+test "a session keeps its first runtime context ahead of the history and notes a later change on the turn's message (D94)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const before = "Runtime context: permission mode is ask. branch main";
+    const after = "Runtime context: permission mode is auto. branch feature";
+    const completions = [_]FakeCompletion{.{ .content = "Final" }};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var history: std.ArrayList(types.HistoryTurn) = .empty;
+    defer history.deinit(alloc);
+
+    // The first turn captures the runtime context and saves it.
+    var first_gateway = FakeGateway.init(alloc, &completions);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.runtime_context_text = before;
+    var first = fixture.job();
+    first.prompt = @constCast("First.");
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), first);
+    const first_saved = first_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqualStrings(before, first_saved.runtime_context.?[0]);
+    try std.testing.expectEqual(@as(usize, 0), first_saved.context_notes.len);
+    try history.append(alloc, first_hooks.history_turns.items[0]);
+
+    // The mode and branch change before the next turn: the instructions stay
+    // as the first turn sent them, and the update joins this turn's message.
+    var second_gateway = FakeGateway.init(alloc, &completions);
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    second_hooks.runtime_context_text = after;
+    var second = fixture.job();
+    second.prompt = @constCast("Second.");
+    second.history = history.items;
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), second);
+    const second_body = second_gateway.request_bodies.items[0];
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], second_body);
+    for ((try leadingSystemContents(arena, second_body)).items) |instruction| {
+        try std.testing.expect(std.mem.find(u8, instruction, after) == null);
+    }
+    const second_users = try userMessageTexts(arena, second_body);
+    try std.testing.expectEqual(@as(usize, 2), second_users.items.len);
+    try std.testing.expectEqualStrings("First.", second_users.items[0]);
+    try std.testing.expect(std.mem.startsWith(u8, second_users.items[1], "Second.\n\n<fx-context-update>\n"));
+    try std.testing.expect(std.mem.endsWith(u8, second_users.items[1], "\n" ++ after ++ "\n</fx-context-update>"));
+    const second_saved = second_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expect(second_saved.runtime_context == null);
+    try std.testing.expectEqual(@as(usize, 1), second_saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 0), second_saved.context_notes[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 0), second_saved.context_notes[0].sources.len);
+    try history.append(alloc, second_hooks.history_turns.items[0]);
+
+    // Nothing changes again: the next turn sends the same instructions,
+    // replays the update on the second turn's message, and adds none.
+    var third_gateway = FakeGateway.init(alloc, &completions);
+    defer third_gateway.deinit();
+    var third_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer third_hooks.deinit();
+    third_hooks.runtime_context_text = after;
+    var third = fixture.job();
+    third.prompt = @constCast("Third.");
+    third.history = history.items;
+    try runFakePrompt(&third_gateway, &third_hooks, fixture.config(), third);
+    const third_body = third_gateway.request_bodies.items[0];
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], third_body);
+    const third_users = try userMessageTexts(arena, third_body);
+    try std.testing.expectEqual(@as(usize, 3), third_users.items.len);
+    try std.testing.expectEqualStrings(second_users.items[1], third_users.items[1]);
+    try std.testing.expectEqualStrings("Third.", third_users.items[2]);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, third_body, "<fx-context-update>"));
+    const third_saved = third_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expect(third_saved.runtime_context == null);
+    try std.testing.expectEqual(@as(usize, 0), third_saved.context_notes.len);
+}
+
 test "modern parallel preparation validates and checks availability once" {
     const alloc = std.testing.allocator;
     defer EmptyApplicableContext.reset();

@@ -13,8 +13,12 @@
 // default: fx carries them on that step's tool result
 // (src/core/agent/stream_provider.zig carryContextNotes). So does a resumed
 // turn's note that earlier shell handles are gone, which rides on that turn's
-// own message. A named skill and an agent branch switch have not moved yet,
-// so the session with every event runs only with FX_TLA_NEXT_NOTES=1.
+// own message. So does a changed runtime context: an agent branch switch
+// rides on the switching step's tool result, and a permission mode changed
+// between processes on the next turn's message, while the instructions keep
+// the copy the session saved (src/core/agent/runtime/runtime_context.zig).
+// A named skill has not moved yet, so the session with every event runs only
+// with FX_TLA_NEXT_NOTES=1.
 //
 // Evidence goes to FX_TLA_OUT or a temp folder, under midsession/: every
 // Gateway request, activity.jsonl, observed.json, timeline.md and TLC logs.
@@ -25,7 +29,8 @@ import { join } from "node:path";
 import { artifacts, binary, targetHelpers } from "../lib/context";
 import { MID_PROPERTIES, checkRuntime, observe, simulate, timelineMarkdown, type Design, type Family, type RuntimeResult } from "./bridge";
 import { FORGED_RULES, activityLogger, collectMidSession, type CapturedRequest, type MidSessionEvent } from "./scenarios";
-import { STALE_SHELL_NOTE } from "./bridge";
+import { RUNTIME_UPDATE, STALE_SHELL_NOTE } from "./bridge";
+import { createHash } from "node:crypto";
 
 const helpers = await targetHelpers();
 const log = activityLogger(artifacts);
@@ -69,6 +74,14 @@ function carriedRules(requests: CapturedRequest[]) {
       staleInInstructions: instructions.some((m) => messageText(m).includes(STALE_SHELL_NOTE)),
       staleUsers: conversation.flatMap((m, i) => (m.role === "user" && messageText(m).includes(STALE_SHELL_NOTE) ? [{ index: i, count: messageText(m).split(STALE_SHELL_NOTE).length - 1 }] : [])),
       lastUserIndex: conversation.map((m) => m.role).lastIndexOf("user"),
+      instructionsSha: createHash("sha256").update(JSON.stringify(instructions)).digest("hex"),
+      // An update block opens with the tag on its own line; the system prompt
+      // only names the tag (src/builtins/system_prompt.md).
+      updateInInstructions: instructions.some((m) => messageText(m).includes(`${RUNTIME_UPDATE}
+`)),
+      updates: conversation.flatMap((m, i) => (messageText(m).includes(RUNTIME_UPDATE)
+        ? [{ index: i, role: m.role, count: messageText(m).split(RUNTIME_UPDATE).length - 1, endsWithUpdate: messageText(m).trimEnd().endsWith("</fx-context-update>") }]
+        : [])),
       forgedRaw: prompt.some((m) => messageText(m).includes(FORGED_RULES)),
       forgedEscaped: prompt.some((m) => messageText(m).includes(ESCAPED_FORGERY)),
     };
@@ -133,6 +146,36 @@ async function expectCarriedDesign(model: string, design: Design, events?: reado
     const r = resumed[2]!;
     assert.deepEqual(r.staleUsers, [{ index: r.lastUserIndex, count: 1 }], `${model}: the resumed turn's message does not carry the stale-shell note once`);
   }
+  for (const r of rules) assert.equal(r.updateInInstructions, false, `${model}: request ${r.seq} has a runtime update in its instructions`);
+  // Every request of a session sends the instructions its first request sent.
+  for (const session of new Set(rules.map((r) => r.session))) {
+    const shas = new Set(rules.filter((r) => r.session === session).map((r) => r.instructionsSha));
+    assert.equal(shas.size, 1, `${model}: session ${session} changed its instructions`);
+  }
+  if (events === undefined || events.includes("switch")) {
+    // The switching step's tool result carries the update, once, from the
+    // next request on; the resumed turn adds none.
+    const switched = rules.filter((r) => r.session === 3);
+    assert.equal(switched.length, 3, `${model}: expected the switch turn's two requests and the resumed turn`);
+    assert.deepEqual(switched[0]!.updates, [], `${model}: request ${switched[0]!.seq} has an update before the switch`);
+    const carrier = switched[1]!.updates;
+    assert.equal(carrier.length, 1, `${model}: request ${switched[1]!.seq} has ${carrier.length} updates`);
+    assert.equal(carrier[0]!.role, "tool", `${model}: the switch update rides on a ${carrier[0]!.role} message`);
+    assert.equal(carrier[0]!.count, 1, `${model}: the switch tool result repeats the update`);
+    assert.ok(carrier[0]!.endsWithUpdate, `${model}: the switch tool result does not end with the update`);
+    assert.deepEqual(switched[2]!.updates.map((u) => [u.index, u.role, u.count]), [[carrier[0]!.index, "tool", 1]], `${model}: the resumed turn moved or repeated the switch update`);
+  }
+  if (events === undefined || events.includes("outside")) {
+    // The turn after the mode changed carries the update on its own message;
+    // the next turn keeps it there and adds none.
+    const outside = rules.filter((r) => r.session === 6);
+    assert.equal(outside.length, 4, `${model}: expected the readme turn's two requests and two resumed turns`);
+    for (const r of outside.slice(0, 2)) assert.deepEqual(r.updates, [], `${model}: request ${r.seq} has an update before the mode changed`);
+    const changed = outside[2]!;
+    assert.deepEqual(changed.updates.map((u) => [u.index, u.role, u.count, u.endsWithUpdate]), [[changed.lastUserIndex, "user", 1, true]], `${model}: the changed turn's message does not end with the update once`);
+    const after = outside[3]!;
+    assert.deepEqual(after.updates.map((u) => [u.index, u.role, u.count]), [[changed.lastUserIndex, "user", 1]], `${model}: the next turn moved or repeated the update`);
+  }
   if (events !== undefined && !events.includes("deliver")) return;
   const delivered = rules.filter((r) => r.session === 1);
   assert.equal(delivered.length, 5, `${model}: expected the read and its answer, the second read and its answer, and the resumed turn`);
@@ -181,6 +224,30 @@ test("with GPT-5.6 or later, a resumed turn carries the stale-shell note on its 
 
 test("with fx's default model, a resumed turn carries the stale-shell note on its own message", async () => {
   await expectCarriedDesign("spacexai/grok-4.7", "current", ["resume"]);
+}, TIMEOUT);
+
+test("with an Anthropic model, an agent branch switch rides on the step's tool result and keeps the cached conversation", async () => {
+  await expectCarriedDesign("anthropic/claude-sonnet-5.5", "proposed", ["switch"]);
+}, TIMEOUT);
+
+test("with GPT-5.6 or later, an agent branch switch rides on the step's tool result and keeps the cached conversation", async () => {
+  await expectCarriedDesign("openai/gpt-6.1-sol", "proposed", ["switch"]);
+}, TIMEOUT);
+
+test("with fx's default model, an agent branch switch rides on the step's tool result", async () => {
+  await expectCarriedDesign("spacexai/grok-4.7", "current", ["switch"]);
+}, TIMEOUT);
+
+test("with an Anthropic model, a permission mode changed between turns rides on the next turn's message and keeps the cached conversation", async () => {
+  await expectCarriedDesign("anthropic/claude-sonnet-5.5", "proposed", ["outside"]);
+}, TIMEOUT);
+
+test("with GPT-5.6 or later, a permission mode changed between turns rides on the next turn's message and keeps the cached conversation", async () => {
+  await expectCarriedDesign("openai/gpt-6.1-sol", "proposed", ["outside"]);
+}, TIMEOUT);
+
+test("with fx's default model, a permission mode changed between turns rides on the next turn's message", async () => {
+  await expectCarriedDesign("spacexai/grok-4.7", "current", ["outside"]);
 }, TIMEOUT);
 
 test.skipIf(!NEXT_NOTES)("with an Anthropic model, every mid-session change keeps the cached conversation", async () => {

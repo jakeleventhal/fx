@@ -46,6 +46,7 @@ const runtime_finalization = @import("finalization.zig");
 const runtime_deps = @import("deps.zig");
 const runtime_lifecycle = @import("lifecycle.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
+const runtime_context_state = @import("runtime_context.zig");
 const compactor = @import("../../compactor/compactor.zig");
 const runtime_text_completion = @import("text_completion.zig");
 const compaction_activity = @import("../../output/compaction_activity.zig");
@@ -3929,7 +3930,7 @@ fn appendRunningToolCalls(
     std.debug.assert(issuing.role == .assistant and issuing.tool_calls.len == calls.len);
     try append(deps.ctx, .{
         .user = .{ .text = @constCast(job.prompt), .images = job.images },
-        .execution = try finalization.compacted_execution.project(arena, execution),
+        .execution = try finalization.persistedExecution(arena, execution),
         .running_calls = running,
         .running_assistant = issuing.content,
     });
@@ -4026,7 +4027,7 @@ fn persistRecoveryCheckpointWithAction(
         arena,
         current_turn_messages,
     );
-    const projected = try finalization.compacted_execution.project(arena, execution);
+    const projected = try finalization.persistedExecution(arena, execution);
     const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images };
     // Every completed piece reaches the session before the next request.
     if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected });
@@ -4152,7 +4153,7 @@ const CompactionSource = struct {
             .turn_id = job.turn_id,
             .user = .{ .text = @constCast(job.prompt), .images = job.images },
             .assistant_source = @constCast(""),
-            .execution = try self.finalization.compacted_execution.project(self.arena, execution),
+            .execution = try self.finalization.persistedExecution(self.arena, execution),
             .cause = .compaction_prepared,
             .action = if (self.tool_evidence == .confirmed) .continuing_after_tool else .retrying_request,
             .tool_state = checkpointToolState(self.tool_evidence),
@@ -7055,6 +7056,15 @@ fn processQueuedPromptLoop(
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
+    // The session sends one runtime context ahead of the history; a change
+    // joins the conversation instead (D94).
+    var runtime_context = try runtime_context_state.State.init(
+        arena,
+        job.history,
+        if (job.recovery_checkpoint) |checkpoint| checkpoint.execution else null,
+    );
+    finalization.captured_runtime_context = runtime_context.captured;
+    debug_trace.logf("context", "runtime context saved_copy={} known_update={}", .{ runtime_context.frozen != null, runtime_context.known_update != null });
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         // The notes the last step's gate queued follow that step's results and
@@ -7089,6 +7099,20 @@ fn processQueuedPromptLoop(
         }
         _ = overlay_arena_state.reset(.retain_capacity);
         const overlay_arena = overlay_arena_state.allocator();
+        // A changed runtime context joins this boundary before its steering,
+        // as the notes above do (D93, D94).
+        var current_runtime_context: std.ArrayList(ChatMessage) = .empty;
+        try deps.append_runtime_context(deps.ctx, overlay_arena, &current_runtime_context);
+        const was_captured = runtime_context.captured != null;
+        const runtime_update = try runtime_context.refresh(arena, overlay_arena, current_runtime_context.items);
+        if (!was_captured and runtime_context.captured != null) {
+            finalization.captured_runtime_context = runtime_context.captured;
+            debug_trace.logf("context", "runtime context captured step={d} messages={d}", .{ current_step_index, runtime_context.messages().len });
+        }
+        if (runtime_update) |note| {
+            try within_turn_suffix.append(arena, .{ .role = .system, .content = note, .context_note = true });
+            debug_trace.logf("context", "runtime context update queued step={d} bytes={d}", .{ current_step_index, note.len });
+        }
         const steering_action = try observe_steering_boundary(
             deps,
             arena,
@@ -7116,7 +7140,7 @@ fn processQueuedPromptLoop(
         if (skills.explicit) |section| {
             if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
         }
-        try deps.append_runtime_context(deps.ctx, overlay_arena, &ephemeral_overlay);
+        try ephemeral_overlay.appendSlice(overlay_arena, runtime_context.messages());
         var parent_turn_delivery = try appendPreparedParentTurnContext(
             deps,
             overlay_arena,
@@ -9588,7 +9612,7 @@ fn processQueuedPromptLoop(
             var turn: HistoryTurn = .{ .assistant = .{
                 .user = .{ .text = job.prompt, .images = job.images },
                 .assistant = @constCast(assistant_text),
-                .execution = try finalization.compacted_execution.project(arena, finish_execution),
+                .execution = try finalization.persistedExecution(arena, finish_execution),
             } };
             types.setHistoryTurnSummary(&turn, completed_summary);
             try deps.propagate_history_turn(deps.ctx, turn);
@@ -12697,7 +12721,7 @@ fn finishFailedTurnWithNotice(
     var turn: HistoryTurn = .{ .assistant = .{
         .user = .{ .text = job.prompt, .images = job.images },
         .assistant = @constCast(notice),
-        .execution = try finalization.compacted_execution.project(arena, execution_memory),
+        .execution = try finalization.persistedExecution(arena, execution_memory),
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     try deps.propagate_history_turn(deps.ctx, turn);

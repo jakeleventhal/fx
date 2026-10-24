@@ -6,6 +6,9 @@
 // 1. With an Anthropic model the binary must conform to exactly one modeled
 //    design, the proposed one, and every design property must hold on the
 //    observed requests, as check.sh's exhaustive check of that design says.
+//    Each design is checked with mid-session changes riding on the message
+//    that caused them (PromptCache Notes, Carrier "message"), as fx sends an
+//    agent branch switch on the switching step's tool result.
 // 2. With OpenAI GPT-5.6 or later the same holds under the model's OpenAI
 //    rules, with the markers in OpenAI's syntax.
 // 3. With an older OpenAI model fx sends no markers of its own: the binary
@@ -43,11 +46,13 @@ const folder = (model: string) => {
   return dir;
 };
 
-// Property verdicts from check.sh's exhaustive check of each design.
+// Property verdicts from check.sh's exhaustive check of each design. A
+// branch switch rides on a message, so even without fx markers the stable
+// instructions are read after it (p6-implicit-context.cfg).
 const EXPECTED: Record<Design, Record<string, string>> = {
   current: {
     Budget: "HOLDS", SessionReuse: "HOLDS", CrossRepoReuse: "VIOLATED",
-    SameWorktreeReuse: "VIOLATED", WorktreeReuse: "VIOLATED", ContextChangeKeepsStable: "VIOLATED",
+    SameWorktreeReuse: "VIOLATED", WorktreeReuse: "VIOLATED", ContextChangeKeepsStable: "HOLDS",
   },
   proposed: {
     Budget: "HOLDS", SessionReuse: "HOLDS", CrossRepoReuse: "HOLDS",
@@ -86,7 +91,7 @@ function verdict(model: string, design: Design): Promise<RuntimeResult> {
   if (!verdicts.has(key)) {
     verdicts.set(key, (async () => {
       const dir = folder(model);
-      const result = await checkRuntime(await observations(model), design, familyOf(model), join(dir, "tlc"));
+      const result = await checkRuntime(await observations(model), design, familyOf(model), join(dir, "tlc"), { notes: true });
       writeFileSync(join(dir, `${design}-design.json`), JSON.stringify(result, null, 2), { mode: 0o600 });
       log("design_checked", { model, design, verdict: result.verdict, detail: result.detail, properties: result.properties });
       return result;
@@ -136,18 +141,18 @@ test("bridge rejects a planted marker, missing coverage and empty evidence", asy
   // A marker on the skills block, which no design places.
   const planted: ObservedRequest[] = structuredClone(observed);
   planted[0]!.manual = [...new Set([...planted[0]!.manual, 3])].sort((a, b) => a - b);
-  const rejected = await checkRuntime(planted, design, "anthropic", join(reports, "control-planted"));
+  const rejected = await checkRuntime(planted, design, "anthropic", join(reports, "control-planted"), { notes: true });
   log("control", { control: "planted_marker", verdict: rejected.verdict });
   assert.equal(rejected.verdict, "REJECTED", explain(rejected));
 
   // Without the sessions after the branch switches, nothing exercises
   // SameWorktreeReuse or ContextChangeKeepsStable.
   const partial = observed.filter((o) => o.s < 4);
-  const missing = await checkRuntime(partial, design, "anthropic", join(reports, "control-partial"));
+  const missing = await checkRuntime(partial, design, "anthropic", join(reports, "control-partial"), { notes: true });
   log("control", { control: "missing_coverage", verdict: missing.verdict, detail: missing.detail });
   assert.equal(missing.verdict, "INCONCLUSIVE", explain(missing));
 
-  const empty = await checkRuntime([], design, "anthropic", join(reports, "control-empty"));
+  const empty = await checkRuntime([], design, "anthropic", join(reports, "control-empty"), { notes: true });
   log("control", { control: "empty", verdict: empty.verdict });
   assert.equal(empty.verdict, "INCONCLUSIVE", explain(empty));
 

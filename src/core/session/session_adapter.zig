@@ -4338,6 +4338,7 @@ noinline fn replay(
                         },
                         .steering => |value| try builder.appendSteering(value.text),
                         .context_note => |value| try builder.appendContextNote(value.text, value.sources),
+                        .runtime_context => |value| try builder.setRuntimeContext(value.messages),
                         .turn_completed => |value| try sink.turn(try presentStoredResults(src, alloc, try builder.finishAssistant(value)), lastStarted(entry)),
                         .interrupted => |value| {
                             interrupted_item = true;
@@ -4770,8 +4771,9 @@ fn itemType(kind: PieceKind) ?[]const u8 {
         .turn_completed => "turn_end",
         .interrupted => "interruption",
         .context_checkpoint => null,
-        // An older fx leaves out an item type it does not know (D17, D93).
+        // An older fx leaves out an item type it does not know (D17, D93, D94).
         .context_note => "context_note",
+        .runtime_context => "runtime_context",
     };
 }
 
@@ -6283,6 +6285,54 @@ test "a turn's context notes come back on resume at their boundaries, before tha
     try testing.expectEqual(@as(usize, 1), execution.steering[0].after_tool_step_count);
     // A turn without notes comes back without any.
     try testing.expectEqual(@as(usize, 0), restored.history[1].assistant.execution.context_notes.len);
+}
+
+test "a turn's runtime context comes back on resume, saved once right after its user message (D94)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    var captured = [_][]u8{ @constCast("<fx-turn-context>\ngit_branch: main\n</fx-turn-context>"), @constCast("Runtime context: permission mode is ask.") };
+    var notes = [_]types.PersistedContextNote{.{ .text = @constCast("note at start"), .after_tool_step_count = 0 }};
+    const user: types.UserTurn = .{ .text = @constCast("two steps") };
+    // Every save of the turn carries it, so the streamed pieces stay a prefix
+    // of the committed turn.
+    try s.appendProgress(user, .{ .tool_steps = fixture.steps[0..1], .context_notes = &notes, .runtime_context = &captured }, .{});
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = fixture.steps[0..2], .context_notes = &notes, .runtime_context = &captured },
+    } }, types.ConversationLanguage.default());
+    try s.commitTurn(assistantTurn("plain", "turn"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.find(u8, bytes, superseded_type) == null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "git_branch: main"));
+    try testing.expect(std.mem.find(u8, bytes, "two steps").? < std.mem.find(u8, bytes, "git_branch: main").?);
+    try testing.expect(std.mem.find(u8, bytes, "git_branch: main").? < std.mem.find(u8, bytes, "note at start").?);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    const execution = restored.history[0].assistant.execution;
+    try testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    try testing.expectEqual(@as(usize, 1), execution.context_notes.len);
+    try testing.expectEqual(captured.len, execution.runtime_context.?.len);
+    for (captured, execution.runtime_context.?) |want, got| try testing.expectEqualStrings(want, got);
+    // A later turn that used the saved copy saves none.
+    try testing.expect(restored.history[1].assistant.execution.runtime_context == null);
 }
 
 test "a compaction inside a turn drops the context notes it covers and keeps the later ones on resume (D93)" {

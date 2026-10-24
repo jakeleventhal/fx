@@ -1358,6 +1358,11 @@ pub const ExecutionMemory = struct {
     /// Context notes the turn took, in order. At one boundary they come
     /// before that boundary's steering.
     context_notes: []PersistedContextNote = &.{},
+    /// The runtime context, one system message text each, that this turn
+    /// captured for the session and sent ahead of the history. Only the turn
+    /// that captured it saves it; later turns send the newest saved copy
+    /// unchanged (D94).
+    runtime_context: ?[][]u8 = null,
     turn_summary: ?TurnSummary = null,
 
     pub fn isEmpty(self: ExecutionMemory) bool {
@@ -2769,11 +2774,14 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     const steering = try dupePersistedSteering(alloc, memory.steering);
     errdefer freePersistedSteering(alloc, steering);
     const context_notes = try dupePersistedContextNotes(alloc, memory.context_notes);
+    errdefer freePersistedContextNotes(alloc, context_notes);
+    const runtime_context = if (memory.runtime_context) |texts| try dupeRuntimeContext(alloc, texts) else null;
     return .{
         .tool_steps = tool_steps,
         .files = files,
         .steering = steering,
         .context_notes = context_notes,
+        .runtime_context = runtime_context,
         .turn_summary = memory.turn_summary,
     };
 }
@@ -2783,6 +2791,27 @@ pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) vo
     freeFileEvidenceSlice(alloc, memory.files);
     freePersistedSteering(alloc, memory.steering);
     freePersistedContextNotes(alloc, memory.context_notes);
+    if (memory.runtime_context) |texts| freeRuntimeContext(alloc, texts);
+}
+
+/// Caller owns the result; free it with `freeRuntimeContext`.
+pub fn dupeRuntimeContext(alloc: std.mem.Allocator, texts: []const []const u8) ![][]u8 {
+    const copies = try alloc.alloc([]u8, texts.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (copies[0..initialized]) |text| alloc.free(text);
+        alloc.free(copies);
+    }
+    for (texts, copies) |text, *copy| {
+        copy.* = try alloc.dupe(u8, text);
+        initialized += 1;
+    }
+    return copies;
+}
+
+pub fn freeRuntimeContext(alloc: std.mem.Allocator, texts: []const []u8) void {
+    for (texts) |text| alloc.free(text);
+    alloc.free(texts);
 }
 
 /// Caller owns the result; free it with `freePersistedContextNotes`.

@@ -1844,10 +1844,14 @@ fn writeExecutionMemoryJsonFrom(
     image_mode: anytype,
 ) !void {
     std.debug.assert(from.tool_steps <= execution.tool_steps.len and from.files <= execution.files.len and from.steering <= execution.steering.len);
-    // Version 11 adds `context_notes` (D93). Only an execution with notes uses
-    // it, so one without keeps version 10 and its exact bytes; an older fx
-    // rejects version 11 as it rejects every newer version.
-    try writer.writeAll(if (format == .durable and execution.context_notes.len > 0)
+    // Version 11 adds `context_notes` (D93) and version 12 `runtime_context`
+    // (D94). Only an execution that has them uses them, so one without keeps
+    // version 10 and its exact bytes; an older fx rejects either version as it
+    // rejects every newer version.
+    const with_runtime_context = format == .durable and execution.runtime_context != null;
+    try writer.writeAll(if (with_runtime_context)
+        "{\"schema_version\":12,\"tool_steps\":["
+    else if (format == .durable and execution.context_notes.len > 0)
         "{\"schema_version\":11,\"tool_steps\":["
     else if (format == .durable)
         "{\"schema_version\":10,\"tool_steps\":["
@@ -1867,10 +1871,11 @@ fn writeExecutionMemoryJsonFrom(
         if (i > 0) try writer.writeByte(',');
         try writeExecutionSteering(writer, steering, format);
     }
-    if (format == .durable and execution.context_notes.len > 0) {
+    if (with_runtime_context or (format == .durable and execution.context_notes.len > 0)) {
         // Only an execution with notes names them, so one without stays as
-        // before (D93). A delta writes them whole: the journal's merge keeps
-        // the delta's list (`journal.zig` mergeDelta).
+        // before (D93); version 12 always names them. A delta writes them
+        // whole: the journal's merge keeps the delta's list (`journal.zig`
+        // mergeDelta).
         try writer.writeAll("],\"context_notes\":[");
         for (execution.context_notes, 0..) |note, i| {
             if (i > 0) try writer.writeByte(',');
@@ -1879,6 +1884,14 @@ fn writeExecutionMemoryJsonFrom(
             try writer.print(",\"after_tool_step_count\":{d},\"sources\":", .{note.after_tool_step_count});
             try std.json.Stringify.value(note.sources, .{}, writer);
             try writer.writeByte('}');
+        }
+    }
+    if (with_runtime_context) {
+        // Whole in every delta too, like the notes above.
+        try writer.writeAll("],\"runtime_context\":[");
+        for (execution.runtime_context.?, 0..) |text, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writeExecutionBytes(writer, text, format);
         }
     }
     if (format == .durable) {
@@ -2004,7 +2017,7 @@ pub fn executionHashes(alloc: Allocator, checkpoint: RecoveryCheckpoint) !Execut
 }
 
 fn hasDurableExecutionMemory(execution: session.ExecutionMemory) bool {
-    return !execution.isEmpty() or execution.turn_summary != null;
+    return !execution.isEmpty() or execution.turn_summary != null or execution.runtime_context != null;
 }
 
 fn writeTurnSummary(writer: *std.Io.Writer, summary: types.TurnSummary) !void {
@@ -2538,6 +2551,7 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
         6 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
         7...10 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
         11 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "context_notes", "turn_summary" }),
+        12 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "context_notes", "runtime_context", "turn_summary" }),
         else => return error.InvalidSessionFormat,
     };
     const tool_steps = try parseToolSteps(
@@ -2564,6 +2578,11 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
     else
         &.{};
     errdefer types.freePersistedContextNotes(alloc, context_notes);
+    const runtime_context: ?[][]u8 = if (object.get("runtime_context")) |texts|
+        try parseRuntimeContext(alloc, texts)
+    else
+        null;
+    errdefer if (runtime_context) |texts| types.freeRuntimeContext(alloc, texts);
     const turn_summary = if (schema_version >= 5)
         try parseOptionalTurnSummary(object.get("turn_summary").?)
     else
@@ -2573,12 +2592,32 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
         .files = files,
         .steering = steering,
         .context_notes = context_notes,
+        .runtime_context = runtime_context,
         .turn_summary = turn_summary,
     };
 }
 
 /// Caller owns the result. Boundaries never decrease and never pass the
 /// turn's steps.
+/// Caller owns the result. A saved runtime context has at least one message.
+fn parseRuntimeContext(alloc: Allocator, value: std.json.Value) ![][]u8 {
+    if (value != .array or value.array.items.len == 0) return error.InvalidSessionFormat;
+    for (value.array.items) |item| {
+        if (item != .string) return error.InvalidSessionFormat;
+    }
+    const texts = try alloc.alloc([]u8, value.array.items.len);
+    var parsed_count: usize = 0;
+    errdefer {
+        for (texts[0..parsed_count]) |text| alloc.free(text);
+        alloc.free(texts);
+    }
+    for (value.array.items, texts) |item, *text| {
+        text.* = try alloc.dupe(u8, item.string);
+        parsed_count += 1;
+    }
+    return texts;
+}
+
 fn parsePersistedContextNotes(
     alloc: Allocator,
     value: std.json.Value,
@@ -4920,6 +4959,73 @@ test "execution memory codec writes context notes only for a turn that has them 
         };
         defer session.freeExecutionMemory(alloc, execution);
         try std.testing.expectEqual(@as(usize, @intFromBool(std.mem.find(u8, case.json, "context_notes") != null)), execution.context_notes.len);
+    }
+}
+
+test "execution memory codec writes the runtime context only for the turn that captured it (D94)" {
+    const alloc = std.testing.allocator;
+    var captured = [_][]u8{ @constCast("<fx-turn-context>\ngit_branch: main\n</fx-turn-context>"), @constCast("Runtime context: permission mode is ask.") };
+    var notes = [_]types.PersistedContextNote{.{ .text = @constCast("rules at start"), .after_tool_step_count = 0 }};
+    const Case = struct { runtime: bool, notes: bool, version: []const u8 };
+    for ([_]Case{
+        .{ .runtime = false, .notes = false, .version = "\"schema_version\":10" },
+        .{ .runtime = false, .notes = true, .version = "\"schema_version\":11" },
+        .{ .runtime = true, .notes = false, .version = "\"schema_version\":12" },
+        .{ .runtime = true, .notes = true, .version = "\"schema_version\":12" },
+    }) |case| {
+        // A turn without tool calls still records what it captured.
+        const turn: session.HistoryTurn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast("done"),
+            .execution = .{
+                .context_notes = if (case.notes) notes[0..] else &.{},
+                .runtime_context = if (case.runtime) captured[0..] else null,
+            },
+        } };
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeHistoryTurn(&encoded.writer, turn);
+        try std.testing.expectEqual(case.runtime, std.mem.find(u8, encoded.written(), "\"runtime_context\"") != null);
+        if (std.mem.find(u8, encoded.written(), case.version) == null) {
+            std.debug.print("expected {s} in {s}\n", .{ case.version, encoded.written() });
+            return error.TestUnexpectedResult;
+        }
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        const decoded = try parseHistoryTurn(alloc, parsed.value);
+        defer session.freeHistoryTurn(alloc, decoded);
+        const execution = decoded.assistant.execution;
+        try std.testing.expectEqual(@as(usize, if (case.notes) 1 else 0), execution.context_notes.len);
+        if (case.runtime) {
+            try std.testing.expectEqual(captured.len, execution.runtime_context.?.len);
+            for (captured, execution.runtime_context.?) |want, got| try std.testing.expectEqualStrings(want, got);
+        } else {
+            try std.testing.expect(execution.runtime_context == null);
+        }
+        var shown: std.Io.Writer.Allocating = .init(alloc);
+        defer shown.deinit();
+        try writeExecutionMemoryJson(&shown.writer, turn.assistant.execution, .presentation);
+        try std.testing.expect(std.mem.find(u8, shown.written(), "runtime_context") == null);
+    }
+
+    // Only version 12 names it, always with the notes, and never empty.
+    for ([_]struct { json: []const u8, valid: bool }{
+        .{ .json = "{\"schema_version\":12,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[\"a\",\"b\"],\"turn_summary\":null}", .valid = true },
+        .{ .json = "{\"schema_version\":12,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[],\"turn_summary\":null}", .valid = false },
+        .{ .json = "{\"schema_version\":12,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[1],\"turn_summary\":null}", .valid = false },
+        .{ .json = "{\"schema_version\":12,\"tool_steps\":[],\"files\":[],\"steering\":[],\"runtime_context\":[\"a\"],\"turn_summary\":null}", .valid = false },
+        .{ .json = "{\"schema_version\":11,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[\"a\"],\"turn_summary\":null}", .valid = false },
+    }) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
+        defer parsed.deinit();
+        if (!case.valid) {
+            try std.testing.expectError(error.InvalidSessionFormat, parseExecutionMemory(alloc, parsed.value));
+            continue;
+        }
+        const execution = try parseExecutionMemory(alloc, parsed.value);
+        defer session.freeExecutionMemory(alloc, execution);
+        try std.testing.expectEqual(@as(usize, 2), execution.runtime_context.?.len);
+        try std.testing.expectEqualStrings("b", execution.runtime_context.?[1]);
     }
 }
 

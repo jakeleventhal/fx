@@ -9,7 +9,9 @@
 (* repository repo, the session s, the request as PromptCache blocks, and  *)
 (* manual, the block positions that carried a cache marker. Whether a      *)
 (* request is a session's first, which request came before it, and whether *)
-(* the turn context changed are derived here, not trusted from the driver. *)
+(* the context changed are derived here, not trusted from the driver: the  *)
+(* turn context differs from the previous request's, or the request        *)
+(* carries more changes on its messages than the previous one did.         *)
 (*                                                                         *)
 (* A check passes when TLC stops on ReplayIncomplete: every request was    *)
 (* replayed and no listed property failed on the way. Conforms holds when  *)
@@ -30,6 +32,9 @@ PC == INSTANCE PromptCache WITH
 Kinds == <<"tools", "base", "skills", "project", "mcp", "ctx", "rt">>
 
 Has(req, kind) == \E j \in 1..Len(req) : req[j].k = kind
+
+\* The messages of a request that carry a change (Carrier "message").
+Carried(req) == Cardinality({j \in 1..Len(req) : req[j].k \in {"asstc", "userc"}})
 
 \* Blocks fx before P6 adds ahead of the history mid-session, and the blocks a
 \* note carrier adds inside it. With Carrier = "message" a change is part of
@@ -82,7 +87,8 @@ Next ==
         /\ log' = Append(log, [w |-> o.w, s |-> o.s, first |-> b = 0, req |-> o.req, bps |-> bps,
                                read |-> PC!ReadWith(o.req, o.manual, cache),
                                prev |-> IF b = 0 THEN <<>> ELSE Observed[b].req,
-                               changed |-> b # 0 /\ Ctx(o.req) # Ctx(Observed[b].req),
+                               changed |-> b # 0 /\ (Ctx(o.req) # Ctx(Observed[b].req)
+                                                       \/ Carried(o.req) > Carried(Observed[b].req)),
                                keep |-> IF b = 0 THEN 0 ELSE Keep(Observed[b].req, o.req),
                                repoSeen |-> \E j \in 1..i : Observed[j].repo = o.repo,
                                worktreeSeen |-> \E j \in 1..i : Observed[j].w = o.w,

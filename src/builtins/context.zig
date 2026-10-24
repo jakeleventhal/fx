@@ -3824,7 +3824,9 @@ test "gateway_system_prompt: local workspace authority" {
     try expectDefaultPromptContains("You are fx, a local coding CLI assistant with tool access.");
     try expectDefaultPromptContains("real local workspace");
     try expectDefaultPromptContains("source of truth for code, docs, commands, and verification");
-    try expectDefaultPromptContains("Treat it as current for the turn; inspect the workspace when it is missing or stale.");
+    // A changed runtime context arrives later as an update block (D94).
+    try expectDefaultPromptContains("fx appends an `<fx-context-update>` block with the current values to the end of the message where it noticed the change");
+    try expectDefaultPromptContains("From then on, its values replace the runtime context above. Inspect the workspace when the values are missing or stale.");
     try expectDefaultPromptContains("Never claim you cannot access local files or run commands when the relevant tools are available.");
 }
 

@@ -19,6 +19,14 @@
 # p6-resume.cfg and p6-openai-resume.cfg add the notice a resumed turn carries when
 # fx restarted with shell handles in the history; p6-mutant-stale-in-instructions.cfg
 # puts it in the instructions, as fx did, which MidSessionKeepsHistory catches.
+# p6-overlay.cfg and p6-openai-overlay.cfg add outside changes: the turn context and
+# runtime block stay as the session started and a change rides on the message where fx
+# noticed it. p6-mutant-overlay-rebuilt.cfg follows the current values on every request,
+# as fx did, and p6-mutant-overlay-not-saved.cfg recaptures them when fx restarts;
+# MidSessionKeepsHistory catches both. p6-implicit-context.cfg checks that
+# with a change carried on a message, even a family fx sends no markers to
+# reads the stable instructions after it, which openai-current-context.cfg
+# shows fx did not before.
 #
 # The openai-*.cfg configs check the same designs under OpenAI GPT-5.6 and later
 # rules (Family = "openai"). openai-mutant-explicit-only.cfg is the agent request
@@ -66,6 +74,7 @@ MCPromptCache p6-mutant-contract-late ContextChangeKeepsStable -deadlock
 MCPromptCache p6-note-claude MidSessionKeepsHistory -deadlock
 MCPromptCache p6-note-openai PreviousFullyReused -deadlock
 MCPromptCache p6-implicit-proposed - -deadlock
+MCPromptCache p6-implicit-context - -deadlock
 MCPromptCache p6-implicit-current-deliver MidSessionKeepsHistory -deadlock
 MCPromptCache p6-remind - -deadlock
 MCPromptCache p6-openai-remind - -deadlock
@@ -73,4 +82,8 @@ MCPromptCache p6-mutant-remind-old-result PreviousFullyReused -deadlock
 MCPromptCache p6-resume - -deadlock
 MCPromptCache p6-openai-resume - -deadlock
 MCPromptCache p6-mutant-stale-in-instructions MidSessionKeepsHistory -deadlock
+MCPromptCache p6-overlay - -deadlock
+MCPromptCache p6-openai-overlay - -deadlock
+MCPromptCache p6-mutant-overlay-rebuilt MidSessionKeepsHistory -deadlock
+MCPromptCache p6-mutant-overlay-not-saved MidSessionKeepsHistory -deadlock
 EOT

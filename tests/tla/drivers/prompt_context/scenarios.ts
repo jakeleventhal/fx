@@ -224,9 +224,11 @@ interface Turn {
   prompt: string;
   /** Scripted Gateway replies for this turn, in order. */
   replies: (helpers: any, id: string) => Response[];
+  /** Run without --full-access, so the permission mode differs from a full-access turn. */
+  defaultAccess?: boolean;
 }
 
-export type MidSessionEvent = "deliver" | "skill" | "switch" | "resume";
+export type MidSessionEvent = "deliver" | "skill" | "switch" | "resume" | "outside";
 
 interface MidSessionPlan {
   session: number;
@@ -265,6 +267,15 @@ const MID_PLANS: MidSessionPlan[] = [
     session: 3, event: "switch", turns: [
       { prompt: "Start a feature branch.", replies: (h, id) => [h.fakeShellRun(id, "git checkout -q -b agent-switch && cat README.md"), h.fakeGatewayFinalText("done")] },
       THANKS,
+    ],
+  },
+  {
+    // The permission mode changes between processes: the resumed turns run
+    // without --full-access. The last turn changes nothing more.
+    session: 6, event: "outside", turns: [
+      { prompt: "Show the readme.", replies: (h, id) => [h.fakeShellRun(id, "cat README.md"), h.fakeGatewayFinalText("done")] },
+      { ...THANKS, defaultAccess: true },
+      { prompt: "Thanks again.", replies: (h) => [h.fakeGatewayFinalText("ok")], defaultAccess: true },
     ],
   },
 ];
@@ -317,7 +328,8 @@ export async function collectMidSession(ctx: RunContext, events?: readonly MidSe
         FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       });
       const resume = index === 0 ? [] : ["--resume", "last"];
-      const argv = [binary, "ask", "--full-access", "--json", ...resume, "--", turn.prompt];
+      const access = turn.defaultAccess ? [] : ["--full-access"];
+      const argv = [binary, "ask", ...access, "--json", ...resume, "--", turn.prompt];
       log("fx_spawn", { session: plan.session, turn: index + 1, event: plan.event, cwd: w1, argv });
       const proc = Bun.spawn(argv, { cwd: w1, env, stdout: "pipe", stderr: "pipe" });
       let timedOut = false;

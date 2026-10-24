@@ -5311,7 +5311,7 @@ test "processQueuedPrompt omits an empty custom tool guidance message" {
     try expectGatewayPromptStringEntry(&gateway, 0, 0, "system");
 }
 
-test "processQueuedPrompt refreshes runtime overlay each step and preserves turn suffix" {
+test "processQueuedPrompt keeps the runtime context ahead of the history and carries a change on the step's tool result (D94)" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
     const completions = [_]FakeCompletion{
@@ -5331,17 +5331,26 @@ test "processQueuedPrompt refreshes runtime overlay each step and preserves turn
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "runtime overlay step one");
     try expectBodyNotContains(&gateway, 0, "runtime overlay step two");
-    try expectBodyContains(&gateway, 1, "runtime overlay step two");
-    try expectBodyNotContains(&gateway, 1, "runtime overlay step one");
     try expectBodyContains(&gateway, 1, "Checking.");
     try expectBodyContains(&gateway, 1, "\"toolName\":\"read_file\"");
-    try expectBodyContains(&gateway, 1, "\"value\":\"ok\"");
+    // The tool result ends with the update.
+    try expectBodyContains(&gateway, 1, "\"value\":\"ok\\n\\n<fx-context-update>\\n");
+    // The first step's copy stays ahead of the history, so the cached prefix
+    // holds; the change rides once on the step's tool result.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[1], "runtime overlay step one"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[1], "runtime overlay step two"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[1], "<fx-context-update>"));
     const first_request_roles = [_]types.ChatRole{ .system, .system, .system, .user };
     const second_request_roles = [_]types.ChatRole{ .system, .system, .system, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
-    const second_request_order = [_][]const u8{ "runtime overlay step two", "user prompt", "Checking.", "\"value\":\"ok\"" };
+    const second_request_order = [_][]const u8{ "runtime overlay step one", "user prompt", "Checking.", "ok", "<fx-context-update>", "runtime overlay step two" };
     try expectBodyContainsInOrder(&gateway, 1, &second_request_order);
+    // The turn saves the copy it captured and the update at its boundary.
+    const saved = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqualStrings("runtime overlay step one", saved.runtime_context.?[0]);
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes[0].after_tool_step_count);
 }
 
 test "processQueuedPrompt refreshes and acknowledges parent deliveries for each tool step" {

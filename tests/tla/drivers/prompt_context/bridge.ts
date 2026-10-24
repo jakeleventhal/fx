@@ -119,6 +119,9 @@ function noteKind(content: string): "note" | "skilltext" | "skillnote" | null {
 /** The note a resumed turn's user message carries when earlier shell handles are gone (src/core/session/session.zig stale_shell_handles_note). */
 export const STALE_SHELL_NOTE = "Runtime context: fx restarted since this session was last active";
 
+/** Opens the note a changed runtime context rides in (src/core/agent/runtime/runtime_context.zig update_open_tag). */
+export const RUNTIME_UPDATE = "<fx-context-update>";
+
 function text(message: any): string {
   return typeof message.content === "string" ? message.content : JSON.stringify(message.content);
 }
@@ -212,8 +215,10 @@ export function abstractRequest(body: string, family: Family): Abstraction {
       continue;
     }
     if (role === "user") {
-      // A resumed turn's message carries the stale-shell note: PromptCache's message carrier.
-      blocks.push({ k: text(prompt[i]).includes(STALE_SHELL_NOTE) ? "userc" : "user", v: short(text(prompt[i])) });
+      // A turn's message carries the stale-shell note or a runtime context
+      // update: PromptCache's message carrier.
+      const carries = text(prompt[i]).includes(STALE_SHELL_NOTE) || text(prompt[i]).includes(RUNTIME_UPDATE);
+      blocks.push({ k: carries ? "userc" : "user", v: short(text(prompt[i])) });
       sources.push([i]);
       marked.push(hasMarker(prompt[i], family));
       continue;
@@ -225,7 +230,7 @@ export function abstractRequest(body: string, family: Family): Abstraction {
     if ((last.k === "asst" || last.k === "asstc") && role !== "assistant") {
       sources.at(-1)!.push(i);
       last.v = short(sources.at(-1)!.map((m) => text(prompt[m])).join("\u0000"));
-      if (role === "tool" && text(prompt[i]).includes("<scoped-rules")) last.k = "asstc";
+      if (role === "tool" && (text(prompt[i]).includes("<scoped-rules") || text(prompt[i]).includes(RUNTIME_UPDATE))) last.k = "asstc";
       if (marked.at(-1)) errors.push(`marker inside an assistant run (before message ${i})`);
       marked[marked.length - 1] = hasMarker(prompt[i], family);
     } else {
@@ -282,11 +287,14 @@ export function derive(observed: ObservedRequest[]): Derived[] {
     const sameSession = earlier.filter((e) => e.s === o.s);
     const prev = sameSession.at(-1) ?? null;
     const ctx = (r: ObservedRequest) => r.req.find((b) => b.k === "ctx")?.v;
+    // The messages that carry a change (Carrier "message").
+    const carried = (r: ObservedRequest) => r.req.filter((b) => b.k === "asstc" || b.k === "userc").length;
     const sameWorktree = earlier.filter((e) => e.w === o.w);
     return {
       first: prev === null,
       prev,
-      changed: prev !== null && ctx(prev) !== ctx(o),
+      // The context changed: in the turn context, or on a message that carries it.
+      changed: prev !== null && (ctx(prev) !== ctx(o) || carried(o) > carried(prev)),
       worktreeSeen: sameWorktree.length > 0,
       worktreeCtxChanged: sameWorktree.length > 0 && ctx(sameWorktree.at(-1)!) !== ctx(o),
       repoSeen: earlier.some((e) => e.repo === o.repo),
@@ -313,7 +321,7 @@ export function coverage(observed: ObservedRequest[]): Record<Property, number> 
     // A request at or after a mid-session change: inserted, noted, carried or switched.
     MidSessionKeepsHistory: d.filter((x, n) => !x.first && (x.changed || rtChanged(x, n) ||
       [observed[n]!, x.prev!].some((r) => r.req.some((b) => MID_KINDS.has(b.k))))).length,
-    PreviousFullyReused: d.filter((x, n) => !x.first && (rtChanged(x, n) ||
+    PreviousFullyReused: d.filter((x, n) => !x.first && (x.changed || rtChanged(x, n) ||
       [observed[n]!, x.prev!].some((r) => r.req.some((b) => MID_KINDS.has(b.k))))).length,
   };
 }
