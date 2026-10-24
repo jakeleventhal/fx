@@ -5647,7 +5647,39 @@ test "request capabilities resolve before capacity planning and Vision routing" 
 const PreparedSkills = struct {
     catalog: ?*const skill_runtime.BoundedPromptSection = null,
     explicit: ?*const skill_invocation.ExplicitPromptSection = null,
+    /// Where the explicit section's note sits in the turn's messages (D95).
+    explicit_note_index: ?usize = null,
 };
+
+/// Puts a named skill's text on the turn's own message: a context note at the
+/// turn's first boundary, after any note already there, which a save records
+/// as `used_note` (D95). A recovered turn already holds that short note; its
+/// full text goes back in the same place. Returns the note's index.
+fn carryExplicitSkill(
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    text: []const u8,
+    used_note: []const u8,
+) Allocator.Error!usize {
+    var boundary: usize = 0;
+    while (boundary < within_turn_suffix.items.len and within_turn_suffix.items[boundary].role == .system and
+        within_turn_suffix.items[boundary].context_note) : (boundary += 1)
+    {
+        const note = &within_turn_suffix.items[boundary];
+        if (std.mem.startsWith(u8, note.content orelse "", skill_invocation.skill_used_open_tag)) {
+            note.context_note_saved_text = note.content;
+            note.content = text;
+            return boundary;
+        }
+    }
+    try within_turn_suffix.insert(arena, boundary, .{
+        .role = .system,
+        .content = text,
+        .context_note = true,
+        .context_note_saved_text = used_note,
+    });
+    return boundary;
+}
 
 fn prepareSkillCatalog(
     alloc: Allocator,
@@ -5868,6 +5900,16 @@ fn processQueuedPromptInner(
             if (explicit_section.?.load_notice) |notice| try push_notice(deps.ctx, notice);
         }
     }
+    // A named skill's text rides on the turn's own message, so the
+    // instructions stay as they were cached; the turn saves a short note in
+    // its place (D95).
+    var explicit_note_index: ?usize = null;
+    if (explicit_section) |section| {
+        if (section.text.len > 0) {
+            explicit_note_index = try carryExplicitSkill(arena, &within_turn_suffix, section.text, section.used_note.?);
+            debug_trace.logf("skills", "explicit skill note queued index={d} bytes={d} saved_bytes={d}", .{ explicit_note_index.?, section.text.len, section.used_note.?.len });
+        }
+    }
     try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, &stable_prefix);
     const active_history = job.history;
     const history_messages_before = stable_prefix.items.len;
@@ -5938,7 +5980,11 @@ fn processQueuedPromptInner(
         lifecycle,
         config,
         job,
-        .{ .catalog = if (skill_section) |*section| section else null, .explicit = if (explicit_section) |*section| section else null },
+        .{
+            .catalog = if (skill_section) |*section| section else null,
+            .explicit = if (explicit_section) |*section| section else null,
+            .explicit_note_index = explicit_note_index,
+        },
         request_capabilities,
         finalization,
         arena,
@@ -6889,6 +6935,8 @@ fn processQueuedPromptLoop(
     var trace_count_after_compaction = false;
     var compaction_history = job.history;
     var compacted_suffix_len: usize = 0;
+    // Where the named skills' note sits in `within_turn_suffix` (D95).
+    var explicit_note_index = skills.explicit_note_index;
     // Request-token calibration lives on the agent so the first request of a
     // new turn still calibrates from the previous turn's exact usage.
     var completed_tool_names = completed_tool_names_ptr.*;
@@ -7137,9 +7185,6 @@ fn processQueuedPromptLoop(
             return;
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
-        if (skills.explicit) |section| {
-            if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
-        }
         try ephemeral_overlay.appendSlice(overlay_arena, runtime_context.messages());
         var parent_turn_delivery = try appendPreparedParentTurnContext(
             deps,
@@ -7737,6 +7782,23 @@ fn processQueuedPromptLoop(
                             .steering = outcome.cut.steering,
                         } else .{};
                         compacted_suffix_len += try runtime_execution_memory.retainedMessageOffset(within_turn_suffix.items[compacted_suffix_len..], active_cut);
+                        // A cut that covers the named skills' note adds it
+                        // again where the kept messages start, so their text
+                        // still rides on the turn's message and the
+                        // instructions stay as they were (D95).
+                        if (explicit_note_index) |index| {
+                            if (index < compacted_suffix_len) {
+                                const section = skills.explicit.?;
+                                try within_turn_suffix.insert(arena, compacted_suffix_len, .{
+                                    .role = .system,
+                                    .content = section.text,
+                                    .context_note = true,
+                                    .context_note_saved_text = section.used_note.?,
+                                });
+                                explicit_note_index = compacted_suffix_len;
+                                debug_trace.logf("skills", "explicit skill note added again after compaction index={d}", .{compacted_suffix_len});
+                            }
+                        }
                         var retained_messages: std.ArrayList(ChatMessage) = .empty;
                         try session_runtime.appendHistoryChatMessages(arena, &retained_messages, outcome.retained_history);
                         try projectEmptyHistoryReplay(arena, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, retained_messages.items);

@@ -1705,6 +1705,35 @@ permission mode does not rewrite a cached prompt prefix):
   context onto the first user message, which changes every session's
   prompt for every model.
 
+Settled for named skills (2026-10-24, so naming a skill does not rewrite a
+cached prompt prefix):
+- **D95 Decision:** the text of a skill the user names with `$name` rides
+  on that turn's user message, and the turn saves a short note in its
+  place.
+  - **The turn:** fx loads the full text as before and adds it as a
+    context note (D93) at the turn's first step boundary, after any note
+    already there, so it joins the user's message. Every request of the
+    turn sends it there, and the instructions stay as they were.
+  - **Saved:** the turn saves only the short note, opened by
+    `<fx-skill-used>`. It names the skills, says fx sent their full text
+    with that message, and says to load them again with the skill tool if
+    they still apply. Later turns and resumes send that note. A recovered
+    turn sends the full text again in the note's place.
+  - **Compaction:** when an in-turn compaction cuts the note, fx adds it
+    again where the kept messages start, so the text still rides on the
+    turn's message and the turn still saves the short note.
+
+  **Why:** the text sat in the instructions for one turn, so it rewrote the
+  cached prefix twice: when it appeared and when it went. On the message,
+  the skill turn reads the whole conversation from the cache, and the next
+  turn pays again only from that message. In live runs of eleven model
+  families, every skill turn followed the skill, against ten of eleven with
+  the text in the instructions, and new tokens at those two requests fell
+  by about half. With the text gone and no note, one model took back its
+  earlier reply on the next turn, saying it had never loaded the skill.
+  **Alternative:** keep the full text in the conversation, which every
+  later request pays for, or keep it in the instructions.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

@@ -46,11 +46,15 @@ export interface ObservedRequest {
   s: number;
   req: Block[];
   manual: number[];
+  /** The block position of the user message that carries a named skill's text, or 0. */
+  skillUser: number;
 }
 
 export interface Abstraction {
   blocks: Block[];
   manual: number[];
+  /** The block position of the user message that carries a named skill's text, or 0. */
+  skillUser: number;
   /** Prompt message indexes that make up each block, in block order. */
   sources: number[][];
   errors: string[];
@@ -79,6 +83,8 @@ const short = (text: string) => sha(text).slice(0, 16);
 /** Blocks today's fx inserts ahead of the history mid-session. */
 const INSERTED = ["scoped", "skill"] as const;
 const SKILL_TEXT = "Explicitly invoked skill content for this query:";
+/** Opens the short note a turn saves in place of a named skill's text (src/core/skills/skill_invocation.zig skill_used_open_tag). */
+const SKILL_USED = "<fx-skill-used>";
 
 type SystemKind = (typeof ORDER)[number] | (typeof INSERTED)[number] | "other";
 
@@ -133,11 +139,12 @@ export function abstractRequest(body: string, family: Family): Abstraction {
   try {
     parsed = JSON.parse(body);
   } catch {
-    return { blocks: [], manual: [], sources: [], errors: ["body is not JSON"] };
+    return { blocks: [], manual: [], skillUser: 0, sources: [], errors: ["body is not JSON"] };
   }
   const prompt: any[] = Array.isArray(parsed.prompt) ? parsed.prompt : [];
   const blocks: Block[] = [{ k: "tools", v: short(JSON.stringify(parsed.tools ?? [])) }];
   const sources: number[][] = [[]];
+  let skillUser = 0;
   const marked: boolean[] = [false];
   if (Array.isArray(parsed.tools) && parsed.tools.some((tool: any) => tool?.providerOptions)) {
     errors.push("a tool carries providerOptions; tool markers are not modeled");
@@ -215,10 +222,14 @@ export function abstractRequest(body: string, family: Family): Abstraction {
       continue;
     }
     if (role === "user") {
-      // A turn's message carries the stale-shell note or a runtime context
-      // update: PromptCache's message carrier.
-      const carries = text(prompt[i]).includes(STALE_SHELL_NOTE) || text(prompt[i]).includes(RUNTIME_UPDATE);
-      blocks.push({ k: carries ? "userc" : "user", v: short(text(prompt[i])) });
+      // A turn's message carries the stale-shell note, a runtime context
+      // update, a named skill's text or the short note saved in its place:
+      // PromptCache's message carrier.
+      const content = text(prompt[i]);
+      const skill = content.includes(SKILL_TEXT);
+      const carries = skill || content.includes(SKILL_USED) || content.includes(STALE_SHELL_NOTE) || content.includes(RUNTIME_UPDATE);
+      blocks.push({ k: carries ? "userc" : "user", v: short(content) });
+      if (skill) skillUser = blocks.length;
       sources.push([i]);
       marked.push(hasMarker(prompt[i], family));
       continue;
@@ -239,9 +250,10 @@ export function abstractRequest(body: string, family: Family): Abstraction {
       marked.push(hasMarker(prompt[i], family));
     }
   }
-  if (!blocks.some((b) => b.k === "user")) errors.push("no user message");
+  // A session's first message can carry a note, such as a named skill's text.
+  if (!blocks.some((b) => b.k === "user" || b.k === "userc")) errors.push("no user message");
   const manual = marked.flatMap((m, n) => (m ? [n + 1] : []));
-  return { blocks, manual, sources, errors };
+  return { blocks, manual, skillUser, sources, errors };
 }
 
 /** Abstracts every agent request, in send order. Title requests are a separate prefix and are left out. */
@@ -251,7 +263,7 @@ export function observe(requests: CapturedRequest[], family: Family): { observed
   for (const request of requests.filter((r) => r.kind === "agent").sort((a, b) => a.seq - b.seq)) {
     const a = abstractRequest(request.body, family);
     for (const e of a.errors) errors.push(`request ${request.seq} (session ${request.session}): ${e}`);
-    observed.push({ seq: request.seq, w: request.worktree, repo: request.repo, s: request.session, req: a.blocks, manual: a.manual });
+    observed.push({ seq: request.seq, w: request.worktree, repo: request.repo, s: request.session, req: a.blocks, manual: a.manual, skillUser: a.skillUser });
   }
   return { observed, errors };
 }
@@ -264,7 +276,7 @@ function word(value: string): string {
 export function observedModule(observed: ObservedRequest[]): string {
   const record = (o: ObservedRequest) => {
     const req = o.req.map((b) => `[k |-> ${word(b.k)}, v |-> ${word(b.v)}]`).join(", ");
-    return `  [w |-> ${word(o.w)}, repo |-> ${word(o.repo)}, s |-> ${o.s}, manual |-> {${o.manual.join(", ")}},\n` +
+    return `  [w |-> ${word(o.w)}, repo |-> ${word(o.repo)}, s |-> ${o.s}, manual |-> {${o.manual.join(", ")}}, skill |-> ${o.skillUser},\n` +
       `   req |-> << ${req} >>]`;
   };
   return [

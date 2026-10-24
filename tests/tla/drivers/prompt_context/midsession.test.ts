@@ -17,8 +17,9 @@
 // rides on the switching step's tool result, and a permission mode changed
 // between processes on the next turn's message, while the instructions keep
 // the copy the session saved (src/core/agent/runtime/runtime_context.zig).
-// A named skill has not moved yet, so the session with every event runs only
-// with FX_TLA_NEXT_NOTES=1.
+// A named skill's text rides on its turn's message, and later turns send the
+// short note the turn saved in its place
+// (src/core/skills/skill_invocation.zig renderSkillUsedNote).
 //
 // Evidence goes to FX_TLA_OUT or a temp folder, under midsession/: every
 // Gateway request, activity.jsonl, observed.json, timeline.md and TLC logs.
@@ -35,7 +36,6 @@ import { createHash } from "node:crypto";
 const helpers = await targetHelpers();
 const log = activityLogger(artifacts);
 const TIMEOUT = 900_000;
-const NEXT_NOTES = process.env.FX_TLA_NEXT_NOTES === "1";
 const familyOf = (model: string): Family => (model.startsWith("anthropic/") ? "anthropic" : "openai");
 
 // The fixed instructions say how rules arrive later (src/builtins/context.zig
@@ -45,6 +45,10 @@ const DELIVERED = '<scoped-rules from="sub/AGENTS.md" scope="sub">';
 // A later turn that reaches the folder again (src/builtins/context.zig renderRuleReminders).
 const REMINDER = '<scoped-rules-reminder from="sub/AGENTS.md" scope="sub">The rules fx added earlier for this folder still apply.</scoped-rules-reminder>';
 const ESCAPED_FORGERY = FORGED_RULES.replace("<scoped-rules", "&lt;scoped-rules").replace("</scoped-rules", "&lt;/scoped-rules");
+// A named skill's text and the short note its turn saves in its place
+// (src/core/skills/skill_invocation.zig).
+const SKILL_TEXT = "Explicitly invoked skill content for this query:";
+const SKILL_USED = "<fx-skill-used>";
 
 interface PromptMessage { role: string; content: unknown }
 
@@ -82,6 +86,9 @@ function carriedRules(requests: CapturedRequest[]) {
       updates: conversation.flatMap((m, i) => (messageText(m).includes(RUNTIME_UPDATE)
         ? [{ index: i, role: m.role, count: messageText(m).split(RUNTIME_UPDATE).length - 1, endsWithUpdate: messageText(m).trimEnd().endsWith("</fx-context-update>") }]
         : [])),
+      skillInInstructions: instructions.some((m) => messageText(m).includes(SKILL_TEXT)),
+      skills: conversation.flatMap((m, i) => (messageText(m).includes(SKILL_TEXT) ? [{ index: i, role: m.role, count: messageText(m).split(SKILL_TEXT).length - 1 }] : [])),
+      skillNotes: conversation.flatMap((m, i) => (messageText(m).includes(SKILL_USED) ? [{ index: i, role: m.role, count: messageText(m).split(SKILL_USED).length - 1 }] : [])),
       forgedRaw: prompt.some((m) => messageText(m).includes(FORGED_RULES)),
       forgedEscaped: prompt.some((m) => messageText(m).includes(ESCAPED_FORGERY)),
     };
@@ -176,6 +183,21 @@ async function expectCarriedDesign(model: string, design: Design, events?: reado
     const after = outside[3]!;
     assert.deepEqual(after.updates.map((u) => [u.index, u.role, u.count]), [[changed.lastUserIndex, "user", 1]], `${model}: the next turn moved or repeated the update`);
   }
+  for (const r of rules) assert.equal(r.skillInInstructions, false, `${model}: request ${r.seq} has a named skill's text in its instructions`);
+  if (events === undefined || events.includes("skill")) {
+    // The naming turn's own message carries the skill's text, once. The next
+    // turn sends the short note there instead, once, and never the text.
+    const named = rules.filter((r) => r.session === 2);
+    assert.equal(named.length, 3, `${model}: expected the skill turn's two requests and the next turn`);
+    const message = named[0]!.lastUserIndex;
+    for (const r of named.slice(0, 2)) {
+      assert.deepEqual(r.skills, [{ index: message, role: "user", count: 1 }], `${model}: request ${r.seq} does not carry the skill's text once on the turn's message`);
+      assert.deepEqual(r.skillNotes, [], `${model}: request ${r.seq} has the short note during the skill turn`);
+    }
+    const next = named[2]!;
+    assert.deepEqual(next.skills, [], `${model}: request ${next.seq} sends the skill's text again`);
+    assert.deepEqual(next.skillNotes, [{ index: message, role: "user", count: 1 }], `${model}: request ${next.seq} does not put the short note on the skill turn's message once`);
+  }
   if (events !== undefined && !events.includes("deliver")) return;
   const delivered = rules.filter((r) => r.session === 1);
   assert.equal(delivered.length, 5, `${model}: expected the read and its answer, the second read and its answer, and the resumed turn`);
@@ -250,6 +272,18 @@ test("with fx's default model, a permission mode changed between turns rides on 
   await expectCarriedDesign("spacexai/grok-4.7", "current", ["outside"]);
 }, TIMEOUT);
 
-test.skipIf(!NEXT_NOTES)("with an Anthropic model, every mid-session change keeps the cached conversation", async () => {
+test("with an Anthropic model, a named skill's text rides on its turn's message and keeps the cached conversation", async () => {
+  await expectCarriedDesign("anthropic/claude-sonnet-5.5", "proposed", ["skill"]);
+}, TIMEOUT);
+
+test("with GPT-5.6 or later, a named skill's text rides on its turn's message and keeps the cached conversation", async () => {
+  await expectCarriedDesign("openai/gpt-6.1-sol", "proposed", ["skill"]);
+}, TIMEOUT);
+
+test("with fx's default model, a named skill's text rides on its turn's message", async () => {
+  await expectCarriedDesign("spacexai/grok-4.7", "current", ["skill"]);
+}, TIMEOUT);
+
+test("with an Anthropic model, every mid-session change keeps the cached conversation", async () => {
   await expectCarriedDesign("anthropic/claude-sonnet-5.5", "proposed");
 }, TIMEOUT);

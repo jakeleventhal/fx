@@ -3076,6 +3076,120 @@ test "a session keeps its first runtime context ahead of the history and notes a
     try std.testing.expectEqual(@as(usize, 0), third_saved.context_notes.len);
 }
 
+test "a named skill's text rides on its turn's message and the turn saves a short note in its place (D95)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try tmp.dir.createDirPath(std.testing.io, "requested-workflow");
+    var file = try tmp.dir.createFile(std.testing.io, "requested-workflow/SKILL.md", .{});
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "---\nname: requested-workflow\ndescription: Requested workflow\n---\nREQUESTED_SKILL_CONTENT\n");
+    const skill_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "requested-workflow");
+    defer alloc.free(skill_path);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{.{
+        .name = "requested-workflow",
+        .description = "Requested workflow",
+        .path = skill_path,
+        .source = .workspace_shared,
+    }};
+    const calls = [_]ToolCall{toolCall("skill_glob", "glob_files", "{\"pattern\":\"*\"}")};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var config = fixture.config();
+    config.skill_catalog = .{ .skills = &skills };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The naming turn: each request's turn message ends with the skill's
+    // text, and the instructions never carry it.
+    var first_gateway = FakeGateway.init(alloc, &.{ .{ .tool_calls = &calls }, .{ .content = "Done" } });
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.enable_recovery_checkpoint = true;
+    var first = fixture.job();
+    first.prompt = @constCast("Use $requested-workflow.");
+    try runFakePrompt(&first_gateway, &first_hooks, config, first);
+    try std.testing.expectEqual(@as(usize, 2), first_gateway.request_bodies.items.len);
+    for (first_gateway.request_bodies.items) |body| {
+        const users = try userMessageTexts(arena, body);
+        try std.testing.expectEqual(@as(usize, 1), users.items.len);
+        try std.testing.expect(std.mem.startsWith(u8, users.items[0], "Use $requested-workflow.\n\nExplicitly invoked skill content for this query:\n"));
+        try std.testing.expect(std.mem.find(u8, users.items[0], "REQUESTED_SKILL_CONTENT") != null);
+        for ((try leadingSystemContents(arena, body)).items) |instruction| {
+            try std.testing.expect(std.mem.find(u8, instruction, "REQUESTED_SKILL_CONTENT") == null);
+        }
+    }
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], first_gateway.request_bodies.items[1]);
+    // The turn saves only the short note, at its start.
+    const saved = first_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 0), saved.context_notes[0].after_tool_step_count);
+    try std.testing.expectEqualStrings(
+        "<fx-skill-used>\nFor that turn the user named the skill requested-workflow, and fx sent its full text with that message. If it still applies, load it again with the skill tool, using its location from the skill catalog.\n</fx-skill-used>",
+        saved.context_notes[0].text,
+    );
+
+    // The next turn sends the same instructions and the short note in the
+    // text's place, never the text again.
+    var second_gateway = FakeGateway.init(alloc, &.{.{ .content = "Ok" }});
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    var second = fixture.job();
+    second.prompt = @constCast("Thanks.");
+    second.history = first_hooks.history_turns.items;
+    try runFakePrompt(&second_gateway, &second_hooks, config, second);
+    const body = second_gateway.request_bodies.items[0];
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], body);
+    try std.testing.expect(std.mem.find(u8, body, "REQUESTED_SKILL_CONTENT") == null);
+    // The first turn's message, its saved file evidence, then this turn's.
+    const users = try userMessageTexts(arena, body);
+    try std.testing.expectEqual(@as(usize, 3), users.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, users.items[1], "Session file evidence from previous tool execution."));
+    try std.testing.expectEqualStrings("Use $requested-workflow.\n\n" ++ "<fx-skill-used>\nFor that turn the user named the skill requested-workflow, and fx sent its full text with that message. If it still applies, load it again with the skill tool, using its location from the skill catalog.\n</fx-skill-used>", users.items[0]);
+    try std.testing.expectEqualStrings("Thanks.", users.items[2]);
+    try std.testing.expectEqual(@as(usize, 0), second_hooks.history_turns.items[0].assistant.execution.context_notes.len);
+
+    // A turn recovered from the checkpoint set right after its tool step
+    // sends the full text again in place of the short note the checkpoint
+    // saved.
+    const checkpoint = checkpoint: {
+        for (first_hooks.recovery_checkpoints.items) |*item| {
+            if (item.execution.tool_steps.len == 1) break :checkpoint item;
+        }
+        return error.TestExpectedCheckpoint;
+    };
+    try std.testing.expectEqualStrings("", checkpoint.assistant_source);
+    try std.testing.expectEqual(@as(usize, 1), checkpoint.execution.context_notes.len);
+    try std.testing.expect(std.mem.startsWith(u8, checkpoint.execution.context_notes[0].text, "<fx-skill-used>"));
+    var restored = try checkpoint.dupe(alloc);
+    defer restored.deinit(alloc);
+    var recovered_gateway = FakeGateway.init(alloc, &.{.{ .content = "Done" }});
+    defer recovered_gateway.deinit();
+    var recovered_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer recovered_hooks.deinit();
+    var recovered = fixture.job();
+    recovered.prompt = @constCast("Use $requested-workflow.");
+    recovered.recovery_checkpoint = restored;
+    try runFakePrompt(&recovered_gateway, &recovered_hooks, config, recovered);
+    try std.testing.expectEqual(@as(usize, 1), recovered_gateway.request_bodies.items.len);
+    const recovered_body = recovered_gateway.request_bodies.items[0];
+    const recovered_users = try userMessageTexts(arena, recovered_body);
+    try std.testing.expect(recovered_users.items.len >= 1);
+    try std.testing.expect(std.mem.startsWith(u8, recovered_users.items[0], "Use $requested-workflow.\n\nExplicitly invoked skill content for this query:\n"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, recovered_body, "REQUESTED_SKILL_CONTENT"));
+    try std.testing.expect(std.mem.find(u8, recovered_body, "<fx-skill-used>") == null);
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], recovered_body);
+    try std.testing.expectEqual(@as(usize, 1), recovered_hooks.history_turns.items.len);
+    const recovered_saved = recovered_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), recovered_saved.context_notes.len);
+    try std.testing.expectEqualStrings(saved.context_notes[0].text, recovered_saved.context_notes[0].text);
+}
+
 test "modern parallel preparation validates and checks availability once" {
     const alloc = std.testing.allocator;
     defer EmptyApplicableContext.reset();

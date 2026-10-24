@@ -64,13 +64,17 @@ Before(n) ==
 
 Ctx(req) == IF Has(req, "ctx") THEN req[PC!PosOf(req, "ctx")] ELSE PC!Block("none", "none")
 
-\* How much of prev the next request must read. On a new user turn after a
-\* named skill, the history before that turn's user message; otherwise all of
-\* prev except the notes at its end.
-Keep(prev, req) ==
-  IF (Has(prev, "skill") \/ Has(prev, "skilltext")) /\ PC!LastUser(req) > PC!LastUser(prev)
-  THEN PC!LastUser(prev) - 1
-  ELSE PC!LastKept(prev)
+\* How much of the request before, Observed[b], the next request must read.
+\* On a new user turn after a named skill, the history before that turn's
+\* user message, whose skill text is swapped for a short note; otherwise all
+\* of it except the notes at its end. The driver records which user message
+\* carried the skill's text (skill), as it records the blocks.
+Keep(b, req) ==
+  LET prev == Observed[b].req
+  IN IF (Has(prev, "skill") \/ Has(prev, "skilltext") \/ Observed[b].skill > 0)
+        /\ PC!LastUser(req) > PC!LastUser(prev)
+     THEN PC!LastUser(prev) - 1
+     ELSE PC!LastKept(prev)
 
 Init ==
   /\ i = 0
@@ -89,7 +93,7 @@ Next ==
                                prev |-> IF b = 0 THEN <<>> ELSE Observed[b].req,
                                changed |-> b # 0 /\ (Ctx(o.req) # Ctx(Observed[b].req)
                                                        \/ Carried(o.req) > Carried(Observed[b].req)),
-                               keep |-> IF b = 0 THEN 0 ELSE Keep(Observed[b].req, o.req),
+                               keep |-> IF b = 0 THEN 0 ELSE Keep(b, o.req),
                                repoSeen |-> \E j \in 1..i : Observed[j].repo = o.repo,
                                worktreeSeen |-> \E j \in 1..i : Observed[j].w = o.w,
                                anySeen |-> i > 0])
