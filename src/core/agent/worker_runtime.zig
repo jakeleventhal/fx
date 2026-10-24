@@ -140,6 +140,9 @@ pub const QueuedPrompt = struct {
     /// Worker begin publishes only its identity so the UI can consume the
     /// pending owner without painting a duplicate card.
     user_prompt_already_presented: bool = false,
+    /// The first turn after a resume whose history names shell handles this
+    /// process does not own. The turn starts with a note saying so (D93).
+    stale_shell_handles: bool = false,
 };
 
 pub const ContextCompactionTask = struct {

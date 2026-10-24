@@ -16,6 +16,10 @@
 # tool result that reaches a folder again; p6-mutant-remind-old-result.cfg puts it
 # on the result that carried the rules instead, which PreviousFullyReused catches.
 #
+# p6-resume.cfg and p6-openai-resume.cfg add the notice a resumed turn carries when
+# fx restarted with shell handles in the history; p6-mutant-stale-in-instructions.cfg
+# puts it in the instructions, as fx did, which MidSessionKeepsHistory catches.
+#
 # The openai-*.cfg configs check the same designs under OpenAI GPT-5.6 and later
 # rules (Family = "openai"). openai-mutant-explicit-only.cfg is the agent request
 # in explicit-only cache mode, which drops in-session reuse.
@@ -66,4 +70,7 @@ MCPromptCache p6-implicit-current-deliver MidSessionKeepsHistory -deadlock
 MCPromptCache p6-remind - -deadlock
 MCPromptCache p6-openai-remind - -deadlock
 MCPromptCache p6-mutant-remind-old-result PreviousFullyReused -deadlock
+MCPromptCache p6-resume - -deadlock
+MCPromptCache p6-openai-resume - -deadlock
+MCPromptCache p6-mutant-stale-in-instructions MidSessionKeepsHistory -deadlock
 EOT

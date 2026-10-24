@@ -257,9 +257,12 @@ const carried_rules_tag = "scoped-rules";
 /// and no provider sees a system message inside the conversation. Every
 /// `<scoped-rules` or `</scoped-rules` in tool output, in any case, starts
 /// with `&lt;` instead, so only fx can open that block there. The note itself
-/// is not escaped. A note has no tool result before it only when a compaction
-/// removed its step and kept the note; it is then sent as a user message of
-/// its own, so its rules stay in view.
+/// is not escaped. A note with no tool result before it joins the user
+/// message right before it: the note a resumed turn starts with joins that
+/// turn's own message, and a saved turn rebuilds the same order, so a resume
+/// sends the same bytes. After any other message, which only a compaction that
+/// removed the note's step leaves, it is sent as a user message of its own, so
+/// its rules stay in view.
 /// Returns `messages` when nothing changes, otherwise a copy in `arena`.
 pub fn carryContextNotes(arena: Allocator, messages: []const types.ChatMessage) Allocator.Error![]const types.ChatMessage {
     const changes = for (messages) |message| {
@@ -272,9 +275,13 @@ pub fn carryContextNotes(arena: Allocator, messages: []const types.ChatMessage) 
     var carrier: ?usize = null;
     for (messages) |message| {
         if (message.context_note) {
-            const index = carrier orelse {
+            const index = carrier orelse joins: {
+                if (carried.items.len > 0) {
+                    const previous = carried.items[carried.items.len - 1];
+                    if (previous.role == .user and !previous.permission_feedback) break :joins carried.items.len - 1;
+                }
                 const bytes = if (message.content) |content| content.len else 0;
-                debug_trace.logf("agent", "context_note_sent_alone reason=no_tool_result_before_it bytes={d}", .{bytes});
+                debug_trace.logf("agent", "context_note_sent_alone reason=no_tool_result_or_user_message_before_it bytes={d}", .{bytes});
                 carried.appendAssumeCapacity(.{ .role = .user, .content = message.content });
                 continue;
             };
@@ -351,6 +358,10 @@ test "a context note rides on the last tool result of its step (D93)" {
         .{ .in = &.{ user, call, last, feedback, note, steer }, .out = &.{ "user", "calling", "last\n\n<scoped-rules>R</scoped-rules>", "feedback", "steer" } },
         // Notes at one boundary join in order; a result with no text gets the note alone.
         .{ .in = &.{ user, call, empty, note, second }, .out = &.{ "user", "calling", "<scoped-rules>R</scoped-rules>\n\nS" } },
+        // With no tool result before it, a note joins the user message right
+        // before it: the turn's own message, or steering.
+        .{ .in = &.{ user, note }, .out = &.{"user\n\n<scoped-rules>R</scoped-rules>"} },
+        .{ .in = &.{ user, call, last, steer, note }, .out = &.{ "user", "calling", "last", "steer\n\n<scoped-rules>R</scoped-rules>" } },
     }) |case| {
         const sent = try carryContextNotes(arena, case.in);
         try std.testing.expectEqual(case.out.len, sent.len);
@@ -360,13 +371,11 @@ test "a context note rides on the last tool result of its step (D93)" {
         }
         try validate_prompt_lanes(&.{}, sent);
     }
-    // A note with no tool result before it in its step, which only a
-    // compaction that kept the note but not its step leaves, is a user
-    // message of its own.
+    // A note after any other message, which only a compaction that kept the
+    // note but not its step leaves, is a user message of its own.
     for ([_][]const types.ChatMessage{
-        &.{ user, note },
-        &.{ user, call, last, steer, note },
         &.{ user, call, last, call, note },
+        &.{ call, note },
     }) |messages| {
         const sent = try carryContextNotes(arena, messages);
         try std.testing.expectEqual(messages.len, sent.len);

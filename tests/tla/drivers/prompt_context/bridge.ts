@@ -116,6 +116,9 @@ function noteKind(content: string): "note" | "skilltext" | "skillnote" | null {
   return null;
 }
 
+/** The note a resumed turn's user message carries when earlier shell handles are gone (src/core/session/session.zig stale_shell_handles_note). */
+export const STALE_SHELL_NOTE = "Runtime context: fx restarted since this session was last active";
+
 function text(message: any): string {
   return typeof message.content === "string" ? message.content : JSON.stringify(message.content);
 }
@@ -209,7 +212,8 @@ export function abstractRequest(body: string, family: Family): Abstraction {
       continue;
     }
     if (role === "user") {
-      blocks.push({ k: "user", v: short(text(prompt[i])) });
+      // A resumed turn's message carries the stale-shell note: PromptCache's message carrier.
+      blocks.push({ k: text(prompt[i]).includes(STALE_SHELL_NOTE) ? "userc" : "user", v: short(text(prompt[i])) });
       sources.push([i]);
       marked.push(hasMarker(prompt[i], family));
       continue;
@@ -294,6 +298,10 @@ export function derive(observed: ObservedRequest[]): Derived[] {
 /** How many requests exercise each property's condition. */
 export function coverage(observed: ObservedRequest[]): Record<Property, number> {
   const d = derive(observed);
+  // The runtime block changed since the previous request of the session, as
+  // when fx put a notice in the instructions mid-session.
+  const rt = (r: ObservedRequest) => r.req.find((b) => b.k === "rt")?.v;
+  const rtChanged = (x: Derived, n: number) => x.prev !== null && rt(x.prev) !== rt(observed[n]!);
   return {
     Budget: observed.length,
     SessionReuse: d.filter((x) => !x.first && !x.changed).length,
@@ -303,10 +311,10 @@ export function coverage(observed: ObservedRequest[]): Record<Property, number> 
     WorktreeReuse: d.filter((x) => x.first && !x.worktreeSeen && x.repoSeen).length,
     ContextChangeKeepsStable: d.filter((x) => x.changed).length,
     // A request at or after a mid-session change: inserted, noted, carried or switched.
-    MidSessionKeepsHistory: d.filter((x, n) => !x.first && (x.changed ||
+    MidSessionKeepsHistory: d.filter((x, n) => !x.first && (x.changed || rtChanged(x, n) ||
       [observed[n]!, x.prev!].some((r) => r.req.some((b) => MID_KINDS.has(b.k))))).length,
-    PreviousFullyReused: d.filter((x, n) => !x.first &&
-      [observed[n]!, x.prev!].some((r) => r.req.some((b) => MID_KINDS.has(b.k)))).length,
+    PreviousFullyReused: d.filter((x, n) => !x.first && (rtChanged(x, n) ||
+      [observed[n]!, x.prev!].some((r) => r.req.some((b) => MID_KINDS.has(b.k))))).length,
   };
 }
 

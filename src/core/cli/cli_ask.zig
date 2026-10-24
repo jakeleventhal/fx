@@ -1758,6 +1758,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         // process_queued_prompt is synchronous here; AskContext keeps the
         // immutable snapshot allocations alive for the whole call.
         .context_snapshot = ctx.context_snapshot,
+        .stale_shell_handles = ctx.session.takeStaleShellHandles(),
     };
 
     const deps = agentRuntimeDeps(&ctx);
@@ -2149,7 +2150,6 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .interactive = false,
         .permission_mode = ctx.permission_mode,
-        .stale_shell_handles = ctx.session.has_stale_shell_handles,
     }, arena, messages);
 }
 

@@ -226,7 +226,7 @@ interface Turn {
   replies: (helpers: any, id: string) => Response[];
 }
 
-export type MidSessionEvent = "deliver" | "skill" | "switch";
+export type MidSessionEvent = "deliver" | "skill" | "switch" | "resume";
 
 interface MidSessionPlan {
   session: number;
@@ -250,6 +250,14 @@ const MID_PLANS: MidSessionPlan[] = [
   {
     session: 2, event: "skill", turns: [
       { prompt: "$r1-skill Show the readme.", replies: (h, id) => [h.fakeShellRun(id, "cat README.md"), h.fakeGatewayFinalText("done")] },
+      THANKS,
+    ],
+  },
+  {
+    // The shell command is still running when the turn ends, so the resumed
+    // process finds a handle it does not own.
+    session: 4, event: "resume", turns: [
+      { prompt: "Start the watcher.", replies: (h, id) => [h.fakeShellRun(id, "sleep 30", { yield_time_ms: 0 }), h.fakeGatewayFinalText("started")] },
       THANKS,
     ],
   },

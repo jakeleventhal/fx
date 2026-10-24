@@ -5732,6 +5732,17 @@ fn processQueuedPromptInner(
             checkpoint.execution,
         );
     }
+    // After a resume whose history names shell handles this process does not
+    // own, the turn says so once, in the conversation, so the instructions
+    // stay as they were cached (D93). It is saved with the turn like any note.
+    if (job.stale_shell_handles) {
+        try within_turn_suffix.append(arena, .{
+            .role = .system,
+            .content = session_runtime.stale_shell_handles_note,
+            .context_note = true,
+        });
+        debug_trace.logf("context", "stale shell handles note queued turn_start=true recovered_messages={d}", .{within_turn_suffix.items.len - 1});
+    }
 
     // The overlay arena is reset for every model step so refreshed env,
     // background snapshots do not accumulate for the whole turn.

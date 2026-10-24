@@ -2909,6 +2909,91 @@ test "rules a tool call reaches ride on the step's tool result and stay out of t
     try std.testing.expectEqual(@as(usize, 1), plain_hooks.history_turns.items[0].assistant.execution.context_notes.len);
 }
 
+/// The text of each user message in a Gateway request body, in order.
+fn userMessageTexts(alloc: std.mem.Allocator, body: []const u8) !std.ArrayList([]const u8) {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, body, .{});
+    var texts: std.ArrayList([]const u8) = .empty;
+    for (parsed.object.get("prompt").?.array.items) |message| {
+        if (!std.mem.eql(u8, message.object.get("role").?.string, "user")) continue;
+        const content = message.object.get("content").?;
+        var text: std.ArrayList(u8) = .empty;
+        switch (content) {
+            .string => |value| try text.appendSlice(alloc, value),
+            .array => |parts| for (parts.items) |part| {
+                if (part.object.get("text")) |value| try text.appendSlice(alloc, value.string);
+            },
+            else => {},
+        }
+        try texts.append(alloc, text.items);
+    }
+    return texts;
+}
+
+test "a resumed turn carries the stale shell handles note on its own message, not in the instructions (D93)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const note = session_runtime.stale_shell_handles_note;
+    const prompt = "Check the build again.";
+    const calls = [_]ToolCall{toolCall("resume_glob", "glob_files", "{\"pattern\":\"*\"}")};
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Final" } };
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The first turn after the resume: every request's turn message ends with
+    // the note, and the instructions never carry it.
+    var first_gateway = FakeGateway.init(alloc, &completions);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    var job = fixture.job();
+    job.prompt = @constCast(prompt);
+    job.permission_mode = .auto;
+    job.stale_shell_handles = true;
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 2), first_gateway.request_bodies.items.len);
+    const carried = prompt ++ "\n\n" ++ note;
+    for (first_gateway.request_bodies.items) |body| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, note));
+        const users = try userMessageTexts(arena, body);
+        try std.testing.expectEqual(@as(usize, 1), users.items.len);
+        try std.testing.expectEqualStrings(carried, users.items[0]);
+        for ((try leadingSystemContents(arena, body)).items) |instruction| {
+            try std.testing.expect(std.mem.find(u8, instruction, "fx restarted since this session") == null);
+        }
+    }
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], first_gateway.request_bodies.items[1]);
+    // It is saved at the start of the turn, without sources.
+    const saved = first_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 0), saved.context_notes[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 0), saved.context_notes[0].sources.len);
+    try std.testing.expectEqualStrings(note, saved.context_notes[0].text);
+
+    // The next turn rebuilds it from the saved turn on the same message, once,
+    // and adds no other copy.
+    var second_gateway = FakeGateway.init(alloc, &completions);
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    var next = fixture.job();
+    next.permission_mode = .auto;
+    next.history = first_hooks.history_turns.items;
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), next);
+    for (second_gateway.request_bodies.items) |body| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, note));
+        const users = try userMessageTexts(arena, body);
+        try std.testing.expectEqualStrings(carried, users.items[0]);
+    }
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], second_gateway.request_bodies.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), second_hooks.history_turns.items[0].assistant.execution.context_notes.len);
+}
+
 test "modern parallel preparation validates and checks availability once" {
     const alloc = std.testing.allocator;
     defer EmptyApplicableContext.reset();

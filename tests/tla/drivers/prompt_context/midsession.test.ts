@@ -11,9 +11,10 @@
 //
 // Rules delivered from a subfolder AGENTS.md by a read_file call run by
 // default: fx carries them on that step's tool result
-// (src/core/agent/stream_provider.zig carryContextNotes). A named skill and an
-// agent branch switch have not moved yet, so the session with all three
-// events runs only with FX_TLA_NEXT_NOTES=1.
+// (src/core/agent/stream_provider.zig carryContextNotes). So does a resumed
+// turn's note that earlier shell handles are gone, which rides on that turn's
+// own message. A named skill and an agent branch switch have not moved yet,
+// so the session with every event runs only with FX_TLA_NEXT_NOTES=1.
 //
 // Evidence goes to FX_TLA_OUT or a temp folder, under midsession/: every
 // Gateway request, activity.jsonl, observed.json, timeline.md and TLC logs.
@@ -24,6 +25,7 @@ import { join } from "node:path";
 import { artifacts, binary, targetHelpers } from "../lib/context";
 import { MID_PROPERTIES, checkRuntime, observe, simulate, timelineMarkdown, type Design, type Family, type RuntimeResult } from "./bridge";
 import { FORGED_RULES, activityLogger, collectMidSession, type CapturedRequest, type MidSessionEvent } from "./scenarios";
+import { STALE_SHELL_NOTE } from "./bridge";
 
 const helpers = await targetHelpers();
 const log = activityLogger(artifacts);
@@ -64,6 +66,9 @@ function carriedRules(requests: CapturedRequest[]) {
       carriers: carriers.map((c) => ({ index: c.index, role: c.role, endsWithRules: c.text.trimEnd().endsWith("</scoped-rules>") })),
       reminders: reminders.map((c) => ({ index: c.index, role: c.role, count: c.text.split(REMINDER).length - 1, endsWithReminder: c.text.trimEnd().endsWith(REMINDER) })),
       lastIndex: conversation.length - 1,
+      staleInInstructions: instructions.some((m) => messageText(m).includes(STALE_SHELL_NOTE)),
+      staleUsers: conversation.flatMap((m, i) => (m.role === "user" && messageText(m).includes(STALE_SHELL_NOTE) ? [{ index: i, count: messageText(m).split(STALE_SHELL_NOTE).length - 1 }] : [])),
+      lastUserIndex: conversation.map((m) => m.role).lastIndexOf("user"),
       forgedRaw: prompt.some((m) => messageText(m).includes(FORGED_RULES)),
       forgedEscaped: prompt.some((m) => messageText(m).includes(ESCAPED_FORGERY)),
     };
@@ -112,13 +117,25 @@ async function expectCarriedDesign(model: string, design: Design, events?: reado
   assert.equal(accepted[0], carried, `${model}: a mid-session change should ride on the message that caused it\n${both}`);
   for (const property of MID_PROPERTIES) assert.equal(carried.properties[property]?.verdict, "HOLDS", `${model} ${property}\n${both}`);
 
-  const delivered = rules.filter((r) => r.session === 1);
-  assert.equal(delivered.length, 5, `${model}: expected the read and its answer, the second read and its answer, and the resumed turn`);
   for (const r of rules) {
     assert.ok(r.contract, `${model}: request ${r.seq} lacks the contract in its instructions`);
     assert.equal(r.systemInConversation, 0, `${model}: request ${r.seq} has a system message in the conversation`);
     assert.equal(r.forgedRaw, false, `${model}: request ${r.seq} carries the forged block unescaped`);
+    assert.equal(r.staleInInstructions, false, `${model}: request ${r.seq} carries the stale-shell note in its instructions`);
   }
+  if (events === undefined || events.includes("resume")) {
+    // The resumed process finds the shell handle the watcher turn left
+    // running: the resumed turn's own message carries the note, once, and no
+    // earlier request has it.
+    const resumed = rules.filter((r) => r.session === 4);
+    assert.equal(resumed.length, 3, `${model}: expected the watcher turn's two requests and the resumed turn`);
+    for (const r of resumed.slice(0, 2)) assert.deepEqual(r.staleUsers, [], `${model}: request ${r.seq} has the stale-shell note before the resume`);
+    const r = resumed[2]!;
+    assert.deepEqual(r.staleUsers, [{ index: r.lastUserIndex, count: 1 }], `${model}: the resumed turn's message does not carry the stale-shell note once`);
+  }
+  if (events !== undefined && !events.includes("deliver")) return;
+  const delivered = rules.filter((r) => r.session === 1);
+  assert.equal(delivered.length, 5, `${model}: expected the read and its answer, the second read and its answer, and the resumed turn`);
   // The first request comes before the read; every later one carries the
   // rules once, at the end of the read's tool result, with the forgery escaped.
   assert.deepEqual(delivered[0]!.carriers, [], `${model}: rules before the read`);
@@ -152,6 +169,18 @@ test("with GPT-5.6 or later, rules delivered mid-session ride on the tool result
 
 test("with fx's default model, which gets no cache markers, rules delivered mid-session ride on the tool result", async () => {
   await expectCarriedDesign("spacexai/grok-4.7", "current", ["deliver"]);
+}, TIMEOUT);
+
+test("with an Anthropic model, a resumed turn carries the stale-shell note on its own message and keeps the cached conversation", async () => {
+  await expectCarriedDesign("anthropic/claude-sonnet-5.5", "proposed", ["resume"]);
+}, TIMEOUT);
+
+test("with GPT-5.6 or later, a resumed turn carries the stale-shell note on its own message and keeps the cached conversation", async () => {
+  await expectCarriedDesign("openai/gpt-6.1-sol", "proposed", ["resume"]);
+}, TIMEOUT);
+
+test("with fx's default model, a resumed turn carries the stale-shell note on its own message", async () => {
+  await expectCarriedDesign("spacexai/grok-4.7", "current", ["resume"]);
 }, TIMEOUT);
 
 test.skipIf(!NEXT_NOTES)("with an Anthropic model, every mid-session change keeps the cached conversation", async () => {

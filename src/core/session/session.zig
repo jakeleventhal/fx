@@ -1323,6 +1323,12 @@ fn collectShellIdsFromExecution(
 /// does not own. Registry membership, not the resume event, decides staleness:
 /// in-process resumes share the registry with executions started by this
 /// process, so those handles stay valid and stay quiet.
+/// What the first turn after such a resume tells the model, as a context
+/// note at the start of that turn (D93): the instructions stay as they were
+/// cached.
+pub const stale_shell_handles_note =
+    "Runtime context: fx restarted since this session was last active, so earlier shell session_id handles no longer exist; stopping or interacting with them fails with ExecutionNotFound. Their processes are normally terminated when fx exits but can survive an unclean exit, so check for a survivor before starting a duplicate. Otherwise start fresh shell sessions instead of reusing earlier handles.";
+
 pub fn detectStaleShellHandles(
     alloc: Allocator,
     history: []const HistoryTurn,
@@ -1380,7 +1386,8 @@ pub const SessionRuntime = struct {
     unversioned_history_len: usize = 0,
     /// True when restored history references shell execution handles that this
     /// process does not own. Resume seams set it once after restore, before the
-    /// first agent turn of the resumed session, so no lock is required.
+    /// first agent turn of the resumed session, so no lock is required. The
+    /// next prompt takes it with `takeStaleShellHandles`.
     has_stale_shell_handles: bool = false,
 
     pub fn init(max_history_turns: usize) SessionRuntime {
@@ -1402,6 +1409,14 @@ pub const SessionRuntime = struct {
         self.permission_state.deinit(alloc);
         self.agent.deinit(alloc);
         self.context_notice_hashes.deinit(alloc);
+    }
+
+    /// Whether the prompt being queued should tell the model that earlier shell
+    /// handles are gone. True once per resume: the turn that carries the note
+    /// keeps it in the conversation, so later turns need no copy.
+    pub fn takeStaleShellHandles(self: *SessionRuntime) bool {
+        defer self.has_stale_shell_handles = false;
+        return self.has_stale_shell_handles;
     }
 
     pub fn reset(self: *SessionRuntime, alloc: Allocator) void {
@@ -3552,6 +3567,12 @@ test "SessionRuntime restore and reset clear stale shell handle state" {
 
     runtime.has_stale_shell_handles = true;
     runtime.reset(alloc);
+    try std.testing.expect(!runtime.has_stale_shell_handles);
+
+    // The first prompt after a resume takes the flag; later prompts do not.
+    runtime.has_stale_shell_handles = true;
+    try std.testing.expect(runtime.takeStaleShellHandles());
+    try std.testing.expect(!runtime.takeStaleShellHandles());
     try std.testing.expect(!runtime.has_stale_shell_handles);
 }
 

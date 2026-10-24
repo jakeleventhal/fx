@@ -901,7 +901,6 @@ pub fn Runtime(comptime App: type) type {
                 .access_scope = workspace.access_scope,
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
-                .stale_shell_handles = app.session.has_stale_shell_handles,
             }, arena, messages);
         }
 
