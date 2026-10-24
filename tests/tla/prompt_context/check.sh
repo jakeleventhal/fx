@@ -12,6 +12,10 @@
 # design that its property must catch; mutant-absolute-paths.cfg is the
 # absolute paths fx sent before, which no worktree of the same repository reuses.
 #
+# p6-remind.cfg and p6-openai-remind.cfg add the reminder a later turn puts on a
+# tool result that reaches a folder again; p6-mutant-remind-old-result.cfg puts it
+# on the result that carried the rules instead, which PreviousFullyReused catches.
+#
 # The openai-*.cfg configs check the same designs under OpenAI GPT-5.6 and later
 # rules (Family = "openai"). openai-mutant-explicit-only.cfg is the agent request
 # in explicit-only cache mode, which drops in-session reuse.
@@ -59,4 +63,7 @@ MCPromptCache p6-note-claude MidSessionKeepsHistory -deadlock
 MCPromptCache p6-note-openai PreviousFullyReused -deadlock
 MCPromptCache p6-implicit-proposed - -deadlock
 MCPromptCache p6-implicit-current-deliver MidSessionKeepsHistory -deadlock
+MCPromptCache p6-remind - -deadlock
+MCPromptCache p6-openai-remind - -deadlock
+MCPromptCache p6-mutant-remind-old-result PreviousFullyReused -deadlock
 EOT

@@ -236,11 +236,14 @@ interface MidSessionPlan {
 
 const THANKS: Turn = { prompt: "Thanks.", replies: (h) => [h.fakeGatewayFinalText("ok")] };
 
-// Each session's first turn has the event; the second turn resumes it.
+// Each session's first turn has the event; the last turn resumes it. The
+// deliver session reads the folder again in its second turn, which gets the
+// reminder line instead of the rules.
 const MID_PLANS: MidSessionPlan[] = [
   {
     session: 1, event: "deliver", turns: [
       { prompt: "Read the sub notes.", replies: (h, id) => [h.fakeGatewayToolCall(id, "read_file", { path: "sub/notes.md" }), h.fakeGatewayFinalText("done")] },
+      { prompt: "Read them again.", replies: (h, id) => [h.fakeGatewayToolCall(id, "read_file", { path: "sub/notes.md" }), h.fakeGatewayFinalText("done")] },
       THANKS,
     ],
   },

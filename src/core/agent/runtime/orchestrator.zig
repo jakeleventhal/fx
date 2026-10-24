@@ -2697,17 +2697,46 @@ const replaced_rules_preface = "The rules below replace the earlier copy from th
 /// results. Takes `selected.content`. The note keeps each delivered file with
 /// its stamp, so a later turn counts an unchanged file as delivered. When a
 /// file changed since an earlier note, the note says it replaces that copy.
+/// Reminders for rules an earlier turn delivered follow in a note of their
+/// own, without sources, and leave `remind_sources` for this turn.
 fn commitContextNote(
     arena: Allocator,
     pending_notes: *std.ArrayList(ChatMessage),
     context_delivery_state: *context_contract.DeliveryState,
     selected: *context_contract.ProviderContext,
     replaced_sources: []const []const u8,
+    remind_sources: *std.ArrayList([]const u8),
 ) Allocator.Error!void {
     if (comptime builtin.is_test) {
         if (TestHooks.context_gate_commit) |hook| try hook();
     }
-    const content = selected.content orelse return context_delivery_state.commit(arena, selected);
+    if (selected.content != null) {
+        try commitRulesNote(arena, pending_notes, context_delivery_state, selected, replaced_sources);
+    } else {
+        try context_delivery_state.commit(arena, selected);
+    }
+    const reminders = selected.reminders orelse return;
+    try pending_notes.append(arena, .{ .role = .system, .content = reminders, .context_note = true });
+    selected.reminders = null;
+    for (selected.reminded_sources) |source| {
+        for (remind_sources.items, 0..) |candidate, index| {
+            if (std.mem.eql(u8, candidate, source)) {
+                _ = remind_sources.orderedRemove(index);
+                break;
+            }
+        }
+    }
+    debug_trace.logf("context", "rule reminder queued sources={d} remaining={d}", .{ selected.reminded_sources.len, remind_sources.items.len });
+}
+
+fn commitRulesNote(
+    arena: Allocator,
+    pending_notes: *std.ArrayList(ChatMessage),
+    context_delivery_state: *context_contract.DeliveryState,
+    selected: *context_contract.ProviderContext,
+    replaced_sources: []const []const u8,
+) Allocator.Error!void {
+    const content = selected.content.?;
     const sources = try arena.alloc(types.ContextNoteSource, selected.delivered_sources.len);
     var replaces = false;
     for (selected.delivered_sources, sources) |source, *dest| {
@@ -2737,11 +2766,13 @@ fn containsPath(paths: []const []const u8, path: []const u8) bool {
 /// file has not changed since, so the gate does not deliver it again (D93).
 /// A changed or missing file goes to `replaced` instead, and the next tool
 /// call that reaches it delivers its current rules in a new note. A note a
-/// compaction dropped is not counted either.
+/// compaction dropped is not counted either. Files an earlier turn's note
+/// delivered also go to `remindable`; the recovered turn's own notes do not.
 fn seedNoteDeliveredSources(
     arena: Allocator,
     state: *context_contract.DeliveryState,
     replaced: *std.ArrayList([]const u8),
+    remindable: *std.ArrayList([]const u8),
     history: []const types.HistoryTurn,
     recovery: ?types.ExecutionMemory,
 ) Allocator.Error!void {
@@ -2751,15 +2782,16 @@ fn seedNoteDeliveredSources(
             .interrupted => |entry| entry.execution,
             .compacted_summary => continue,
         };
-        try seedNoteSources(arena, state, replaced, execution.context_notes);
+        try seedNoteSources(arena, state, replaced, remindable, execution.context_notes);
     }
-    if (recovery) |execution| try seedNoteSources(arena, state, replaced, execution.context_notes);
+    if (recovery) |execution| try seedNoteSources(arena, state, replaced, null, execution.context_notes);
 }
 
 fn seedNoteSources(
     arena: Allocator,
     state: *context_contract.DeliveryState,
     replaced: *std.ArrayList([]const u8),
+    remindable: ?*std.ArrayList([]const u8),
     notes: []const types.PersistedContextNote,
 ) Allocator.Error!void {
     for (notes) |note| for (note.sources) |source| {
@@ -2774,6 +2806,9 @@ fn seedNoteSources(
             }
             if (!containsPath(state.delivered_sources.items, source.path)) {
                 try state.delivered_sources.append(arena, try arena.dupe(u8, source.path));
+            }
+            if (remindable) |list| {
+                if (!containsPath(list.items, source.path)) try list.append(arena, try arena.dupe(u8, source.path));
             }
             continue;
         }
@@ -6854,10 +6889,14 @@ fn processQueuedPromptLoop(
     // Files saved notes delivered that changed since; their current rules
     // are delivered again when a tool call reaches them.
     var replaced_note_sources: std.ArrayList([]const u8) = .empty;
+    // Files an earlier turn's notes delivered: the first tool call this turn
+    // that reaches one again gets a reminder line in place of the rules.
+    var remind_sources: std.ArrayList([]const u8) = .empty;
     if (deps.context_enabled) try seedNoteDeliveredSources(
         arena,
         &context_delivery_state,
         &replaced_note_sources,
+        &remind_sources,
         job.history,
         if (job.recovery_checkpoint) |checkpoint| checkpoint.execution else null,
     );
@@ -9983,6 +10022,7 @@ fn processQueuedPromptLoop(
                 .targets = preparation_batch.applicable_targets.items,
                 .delivered_sources = context_delivery_state.delivered_sources.items,
                 .evaluated_endpoints = context_delivery_state.evaluated_endpoints.items,
+                .remind_sources = remind_sources.items,
                 .context_limits = config.context_limits,
             }) catch |err| {
                 return settleFailedContextGate(
@@ -10086,7 +10126,7 @@ fn processQueuedPromptLoop(
                 return;
             }
 
-            commitContextNote(arena, &pending_context_notes, &context_delivery_state, &selected, replaced_note_sources.items) catch |err| {
+            commitContextNote(arena, &pending_context_notes, &context_delivery_state, &selected, replaced_note_sources.items, &remind_sources) catch |err| {
                 return settleFailedContextGate(
                     deps,
                     &stream_ctx.provisional_statuses,

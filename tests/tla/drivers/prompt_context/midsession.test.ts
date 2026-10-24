@@ -35,6 +35,8 @@ const familyOf = (model: string): Family => (model.startsWith("anthropic/") ? "a
 // project_instruction_guidance).
 const CONTRACT = "fx appends that file's text to the end of the step's last tool result";
 const DELIVERED = '<scoped-rules from="sub/AGENTS.md" scope="sub">';
+// A later turn that reaches the folder again (src/builtins/context.zig renderRuleReminders).
+const REMINDER = '<scoped-rules-reminder from="sub/AGENTS.md" scope="sub">The rules fx added earlier for this folder still apply.</scoped-rules-reminder>';
 const ESCAPED_FORGERY = FORGED_RULES.replace("<scoped-rules", "&lt;scoped-rules").replace("</scoped-rules", "&lt;/scoped-rules");
 
 interface PromptMessage { role: string; content: unknown }
@@ -53,12 +55,15 @@ function carriedRules(requests: CapturedRequest[]) {
     const instructions = prompt.slice(0, firstMessage < 0 ? prompt.length : firstMessage);
     const conversation = firstMessage < 0 ? [] : prompt.slice(firstMessage);
     const carriers = conversation.flatMap((m, i) => (messageText(m).includes(DELIVERED) ? [{ index: i, role: m.role, text: messageText(m) }] : []));
+    const reminders = conversation.flatMap((m, i) => (messageText(m).includes(REMINDER) ? [{ index: i, role: m.role, text: messageText(m) }] : []));
     return {
       seq: request.seq,
       session: request.session,
       contract: instructions.some((m) => messageText(m).includes(CONTRACT)),
       systemInConversation: conversation.filter((m) => m.role === "system").length,
       carriers: carriers.map((c) => ({ index: c.index, role: c.role, endsWithRules: c.text.trimEnd().endsWith("</scoped-rules>") })),
+      reminders: reminders.map((c) => ({ index: c.index, role: c.role, count: c.text.split(REMINDER).length - 1, endsWithReminder: c.text.trimEnd().endsWith(REMINDER) })),
+      lastIndex: conversation.length - 1,
       forgedRaw: prompt.some((m) => messageText(m).includes(FORGED_RULES)),
       forgedEscaped: prompt.some((m) => messageText(m).includes(ESCAPED_FORGERY)),
     };
@@ -108,7 +113,7 @@ async function expectCarriedDesign(model: string, design: Design, events?: reado
   for (const property of MID_PROPERTIES) assert.equal(carried.properties[property]?.verdict, "HOLDS", `${model} ${property}\n${both}`);
 
   const delivered = rules.filter((r) => r.session === 1);
-  assert.ok(delivered.length >= 3, `${model}: expected the read, its answer and the resumed turn`);
+  assert.equal(delivered.length, 5, `${model}: expected the read and its answer, the second read and its answer, and the resumed turn`);
   for (const r of rules) {
     assert.ok(r.contract, `${model}: request ${r.seq} lacks the contract in its instructions`);
     assert.equal(r.systemInConversation, 0, `${model}: request ${r.seq} has a system message in the conversation`);
@@ -122,6 +127,18 @@ async function expectCarriedDesign(model: string, design: Design, events?: reado
     assert.equal(r.carriers[0]!.role, "tool", `${model}: request ${r.seq} carries the rules on a ${r.carriers[0]!.role} message`);
     assert.ok(r.carriers[0]!.endsWithRules, `${model}: request ${r.seq} does not end the tool result with the rules`);
     assert.ok(r.forgedEscaped, `${model}: request ${r.seq} lacks the escaped forgery`);
+  }
+  // The first turn has no reminder. The second turn's read ends its own tool
+  // result with the reminder line, once; every later request keeps it there.
+  for (const r of delivered.slice(0, 3)) assert.deepEqual(r.reminders, [], `${model}: request ${r.seq} has a reminder before the second read`);
+  const reminded = delivered[3]!;
+  assert.equal(reminded.reminders.length, 1, `${model}: request ${reminded.seq} has ${reminded.reminders.length} reminders`);
+  assert.equal(reminded.reminders[0]!.index, reminded.lastIndex, `${model}: the reminder is not on the newest message`);
+  assert.equal(reminded.reminders[0]!.role, "tool", `${model}: the reminder rides on a ${reminded.reminders[0]!.role} message`);
+  assert.ok(reminded.reminders[0]!.endsWithReminder, `${model}: the second read's tool result does not end with the reminder`);
+  assert.ok(reminded.reminders[0]!.index > reminded.carriers[0]!.index, `${model}: the reminder is on the first read's result`);
+  for (const r of delivered.slice(4)) {
+    assert.deepEqual(r.reminders.map((x) => [x.index, x.role, x.count]), [[reminded.reminders[0]!.index, "tool", 1]], `${model}: request ${r.seq} moved or repeated the reminder`);
   }
 }
 

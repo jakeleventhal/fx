@@ -78,9 +78,15 @@
 (*              and on OpenAI a note is not an eligible message, so it is  *)
 (*              cached only after the next one.                            *)
 (* At the end of a skill turn the skill text is swapped for a short note.  *)
+(* Event "remind" is a tool step in a later turn that reaches a folder      *)
+(* whose rules an earlier turn delivered: fx appends a one-line reminder   *)
+(* to that step's tool result (src/builtins/context.zig                    *)
+(* renderRuleReminders), at most once per folder per turn.                 *)
 (* Mutation "note_not_saved" drops each change at the next user turn, as   *)
 (* if it were not saved with the session. Mutation "contract_late" adds    *)
 (* the fixed contract to the instructions only once rules arrive.          *)
+(* Mutation "remind_old_result" adds the reminder to the tool result that  *)
+(* carried the rules instead of the step's own result.                     *)
 (*                                                                         *)
 (* Abstraction: a block is a [k, v] record; equal v means equal bytes.     *)
 (* Tokens, cache lifetime, eviction and the provider's 20-block lookback   *)
@@ -99,18 +105,18 @@ CONSTANTS
   Limit,        \* blocks per request that may carry a cache marker
   PathScoped,   \* skill catalog and project rules embed the worktree path
   Family,       \* "anthropic" | "openai": the provider's cache rules
-  Events,       \* mid-session events: a subset of {"switch", "deliver", "skill"}
+  Events,       \* mid-session events: a subset of {"switch", "deliver", "skill", "remind"}
   Notes,        \* mid-session changes join the conversation, not the instructions
   Carrier       \* "message" | "note": where such a change goes
 
 ASSUME Design \in {"current", "proposed"}
 ASSUME Family \in {"anthropic", "openai"}
 ASSUME Mutation \in {"none", "mark_every_system", "fence_after_context", "no_auto",
-                     "note_not_saved", "contract_late"}
+                     "note_not_saved", "contract_late", "remind_old_result"}
 ASSUME Carrier \in {"message", "note"}
 ASSUME MaxSessions \in Nat /\ MaxSteps \in Nat /\ Limit \in Nat
 ASSUME PathScoped \in BOOLEAN
-ASSUME Events \subseteq {"switch", "deliver", "skill"} /\ Notes \in BOOLEAN
+ASSUME Events \subseteq {"switch", "deliver", "skill", "remind"} /\ Notes \in BOOLEAN
 
 Block(k, v) == [k |-> k, v |-> v]
 
@@ -215,7 +221,8 @@ vars == <<cache, sessions, active, log, branchOf>>
 NoSession == [on |-> FALSE, w |-> "none", s |-> 0, n |-> 0, br |-> "b1", br0 |-> "b1",
               hist |-> <<>>, last |-> <<>>, switched |-> FALSE, delivered |-> FALSE,
               skilled |-> FALSE, scopedTurn |-> FALSE, scopedStable |-> FALSE,
-              skill |-> FALSE, skillUser |-> 0, skillText |-> 0]
+              skill |-> FALSE, skillUser |-> 0, skillText |-> 0,
+              carrierAt |-> 0, remindable |-> FALSE, reminded |-> FALSE]
 
 (* The instructions of session a's next request. With Notes they stay as   *)
 (* the session started; otherwise they carry today's mid-session           *)
@@ -278,14 +285,18 @@ Uncarried(b) ==
     [] OTHER -> b
 
 (* The next request of the session. "step" is a tool step and "turn" a new *)
-(* user turn; "switch", "deliver" and "skill" are the events in Events,    *)
-(* described above. Each event happens at most once per session.           *)
+(* user turn; "switch", "deliver", "skill" and "remind" are the events in  *)
+(* Events, described above. Each event happens at most once per session,   *)
+(* and "remind" only after a user turn that followed the delivery. Before  *)
+(* P6 (Notes = FALSE) the rules sit in the instructions and "remind" is a  *)
+(* plain step.                                                             *)
 Continue(kind) ==
   LET a == active
       n == a.n + 1
       isTurn == kind \in {"turn", "skill"}
-      event == kind \in {"switch", "deliver", "skill"}
+      event == kind \in {"switch", "deliver", "skill"} \/ (kind = "remind" /\ Notes)
       carried == Notes /\ Carrier = "message"
+      misplaced == kind = "remind" /\ carried /\ Mutation = "remind_old_result"
       br == IF kind = "switch" THEN "b2" ELSE a.br
       swapped == IF isTurn /\ Notes /\ a.skillText > 0
                  THEN [a.hist EXCEPT ![a.skillText] =
@@ -296,15 +307,19 @@ Continue(kind) ==
               THEN IF carried THEN [i \in 1..Len(swapped) |-> Uncarried(swapped[i])]
                    ELSE SelectSeq(swapped, LAMBDA b : b.k # "note")
               ELSE swapped
+      reminded == IF misplaced
+                  THEN [kept EXCEPT ![a.carrierAt] = Block(@.k, @.v \o "+remind")]
+                  ELSE kept
       msgKind == CASE isTurn /\ carried /\ event -> "userc"
                    [] isTurn -> "user"
-                   [] carried /\ event -> "asstc"
+                   [] carried /\ event /\ ~misplaced -> "asstc"
                    [] OTHER -> "asst"
-      withMsg == Append(kept, Block(msgKind, ToString(a.s) \o "." \o ToString(n)))
+      withMsg == Append(reminded, Block(msgKind, ToString(a.s) \o "." \o ToString(n)))
       hist == CASE ~Notes \/ carried -> withMsg
                 [] kind = "switch" -> Append(withMsg, Block("note", "branch"))
                 [] kind = "deliver" -> Append(withMsg, Block("note", "scoped"))
                 [] kind = "skill" -> Append(withMsg, Block("skilltext", "k"))
+                [] kind = "remind" -> Append(withMsg, Block("note", "remind"))
                 [] OTHER -> withMsg
       next == [a EXCEPT !.n = n, !.br = br, !.hist = hist,
                         !.switched = a.switched \/ kind = "switch",
@@ -317,7 +332,11 @@ Continue(kind) ==
                         !.skillUser = (IF kind = "skill" THEN Len(withMsg)
                                        ELSE IF isTurn THEN 0 ELSE a.skillUser),
                         !.skillText = (IF Notes /\ kind = "skill" THEN Len(hist)
-                                       ELSE IF isTurn THEN 0 ELSE a.skillText)]
+                                       ELSE IF isTurn THEN 0 ELSE a.skillText),
+                        !.carrierAt = (IF kind = "deliver" /\ carried THEN Len(withMsg)
+                                       ELSE a.carrierAt),
+                        !.remindable = a.remindable \/ (isTurn /\ a.delivered),
+                        !.reminded = a.reminded \/ kind = "remind"]
       req == Lead(next) \o hist
       \* On the turn after a named skill, only the history before that turn's
       \* user message must be read.
@@ -330,6 +349,7 @@ Continue(kind) ==
      /\ kind = "switch" => ~a.switched
      /\ kind = "deliver" => ~a.delivered
      /\ kind = "skill" => ~a.skilled
+     /\ kind = "remind" => a.remindable /\ ~a.reminded
      /\ active' = [next EXCEPT !.last = req]
      /\ Send(a.w, a.s, req, FALSE, a.last, event, keep)
      /\ branchOf' = [branchOf EXCEPT ![a.w] = br]
@@ -350,7 +370,7 @@ ExternalSwitch(w) ==
 
 Next ==
   \/ \E w \in Worktrees : Start(w)
-  \/ \E kind \in {"step", "turn", "switch", "deliver", "skill"} : Continue(kind)
+  \/ \E kind \in {"step", "turn", "switch", "deliver", "skill", "remind"} : Continue(kind)
   \/ End
   \/ \E w \in Worktrees : ExternalSwitch(w)
 

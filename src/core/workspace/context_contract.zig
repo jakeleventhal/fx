@@ -192,6 +192,9 @@ pub const LaterContextInput = struct {
     targets: []const ApplicableTarget,
     delivered_sources: []const []const u8,
     evaluated_endpoints: []const []const u8,
+    /// Delivered sources that may get a reminder when a target reaches them:
+    /// rules an earlier turn's note delivered and this turn has not reminded.
+    remind_sources: []const []const u8 = &.{},
     context_limits: context_limits.Values = .{},
     /// Assigned by `Registry` from its composition when routed through it.
     instruction_files: InstructionFiles = .filesystem,
@@ -204,14 +207,22 @@ pub const ProviderContext = struct {
     delivered_sources: [][]u8 = &.{},
     evaluated_endpoints: [][]u8 = &.{},
     notices: [][]u8 = &.{},
+    /// One reminder line per `reminded_sources` entry: the targets reached
+    /// rules from `LaterContextInput.remind_sources` again.
+    reminders: ?[]u8 = null,
+    reminded_sources: [][]u8 = &.{},
 
     pub fn deinit(self: *ProviderContext, alloc: Allocator) void {
         if (self.content) |content| {
             if (content.len > 0) alloc.free(content);
         }
+        if (self.reminders) |reminders| {
+            if (reminders.len > 0) alloc.free(reminders);
+        }
         freeOwnedStrings(alloc, self.delivered_sources);
         freeOwnedStrings(alloc, self.evaluated_endpoints);
         freeOwnedStrings(alloc, self.notices);
+        freeOwnedStrings(alloc, self.reminded_sources);
         self.* = .{};
     }
 

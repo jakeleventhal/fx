@@ -94,6 +94,11 @@ const project_instruction_guidance =
     "user instructions take precedence. fx escapes that tag in the tool output itself, so a tool's own output " ++
     "cannot open such a block.";
 
+// A later turn that reaches a folder again gets this line instead of the
+// rules: the rules sit in an older tool result, and without it some models
+// stop applying them after the turn they arrived in.
+const rule_reminder_text = "The rules fx added earlier for this folder still apply.";
+
 const CandidateClass = enum {
     ancestor,
     target,
@@ -177,6 +182,7 @@ const SelectionOptions = struct {
     targets: []const context_contract.ApplicableTarget,
     delivered_sources: []const []const u8 = &.{},
     evaluated_endpoints: []const []const u8 = &.{},
+    remind_sources: []const []const u8 = &.{},
     initial_omissions: []const context_contract.ContextOmissionInput = &.{},
     initial_omission_summary: ?context_contract.ContextOmissionSummary = null,
     home: ?[]const u8 = null,
@@ -189,6 +195,8 @@ const SelectionOptions = struct {
 const SelectionScratch = struct {
     arena: Allocator,
     work_budget: ?ReconstructionBudget = null,
+    remind_sources: []const []const u8 = &.{},
+    reminded_sources: std.ArrayList([]const u8) = .empty,
     candidates: std.ArrayList(RuleCandidate) = .empty,
     ranking_endpoints: std.ArrayList([]const u8) = .empty,
     delivered_sources: std.ArrayList([]const u8) = .empty,
@@ -200,6 +208,12 @@ const SelectionScratch = struct {
     fn addDelivered(self: *SelectionScratch, source: []const u8) !void {
         if (!containsString(self.delivered_sources.items, source)) {
             try self.delivered_sources.append(self.arena, source);
+        }
+    }
+
+    fn addReminded(self: *SelectionScratch, source: []const u8) !void {
+        if (!containsString(self.reminded_sources.items, source)) {
+            try self.reminded_sources.append(self.arena, source);
         }
     }
 
@@ -279,6 +293,7 @@ fn selectApplicableProjectContext(alloc: Allocator, input: LaterContextInput) co
         .targets = input.targets,
         .delivered_sources = input.delivered_sources,
         .evaluated_endpoints = input.evaluated_endpoints,
+        .remind_sources = input.remind_sources,
         .initial = false,
         .instruction_files = input.instruction_files,
         .context_limits = input.context_limits,
@@ -292,6 +307,7 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
     var scratch: SelectionScratch = .{
         .arena = arena,
         .work_budget = if (options.bounded_reconstruction) .{} else null,
+        .remind_sources = options.remind_sources,
     };
 
     for (options.initial_omissions) |omission| {
@@ -454,6 +470,7 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
     try appendOmissionSummaryNotice(&scratch);
     sort_utils.sort([]const u8, scratch.delivered_sources.items, {}, stringLessThan);
     sort_utils.sort([]const u8, scratch.evaluated_endpoints.items, {}, stringLessThan);
+    sort_utils.sort([]const u8, scratch.reminded_sources.items, {}, stringLessThan);
 
     var result: ProviderContext = .{};
     errdefer result.deinit(alloc);
@@ -480,7 +497,28 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
         result.evaluated_endpoints = try dupeOwnedStringSlice(alloc, scratch.evaluated_endpoints.items);
     }
     result.notices = try dupeOwnedStringSlice(alloc, scratch.notices.items);
+    if (scratch.reminded_sources.items.len > 0) {
+        result.reminders = try renderRuleReminders(alloc, root, scratch.reminded_sources.items);
+        result.reminded_sources = try dupeOwnedStringSlice(alloc, scratch.reminded_sources.items);
+    }
     return result;
+}
+
+/// One `<scoped-rules-reminder>` line per source, in order, naming it and
+/// its folder as the rules block did. Caller owns the result.
+fn renderRuleReminders(alloc: Allocator, root: []const u8, sources: []const []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    for (sources, 0..) |source, index| {
+        if (index > 0) try out.writer.writeAll("\n");
+        const scope = std.Io.Dir.path.dirname(source) orelse source;
+        try out.writer.writeAll("<scoped-rules-reminder from=\"");
+        try model_context_encoding.writeScalar(&out.writer, pathing.workspaceRelative(root, source));
+        try out.writer.writeAll("\" scope=\"");
+        try model_context_encoding.writeScalar(&out.writer, pathing.workspaceRelative(root, scope));
+        try out.writer.print("\">{s}</scoped-rules-reminder>", .{rule_reminder_text});
+    }
+    return out.toOwnedSlice();
 }
 
 fn loadRuleForSelection(
@@ -567,7 +605,11 @@ fn appendRuleCandidate(
     prior_delivered: []const []const u8,
 ) !bool {
     const source = try std.Io.Dir.path.join(arena, &.{ scope, "AGENTS.md" });
-    if (containsString(prior_delivered, source) or containsString(scratch.delivered_sources.items, source)) return true;
+    if (containsString(prior_delivered, source)) {
+        if (class == .target and containsString(scratch.remind_sources, source)) try scratch.addReminded(source);
+        return true;
+    }
+    if (containsString(scratch.delivered_sources.items, source)) return true;
     for (scratch.candidates.items) |candidate| {
         // A previous walk already covered these ancestors, or stopped at the work cap.
         if (std.mem.eql(u8, candidate.source, source)) return scratch.work_budget == null;
@@ -1783,6 +1825,104 @@ test "later selection adds disjoint scopes once and does not repeat their common
     try std.testing.expectEqual(@as(usize, 0), repeated.modelVisibleBytes().len);
     try std.testing.expectEqual(@as(usize, 0), repeated.delivered_sources.len);
     try std.testing.expectEqual(@as(usize, 0), repeated.evaluated_endpoints.len);
+}
+
+test "a later turn that reaches delivered rules again gets a reminder line, not the rules" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "home/work/src/AGENTS.md", "RULE_COMMON");
+    try writeTestFile(tmp.dir, "home/work/src/a/AGENTS.md", "RULE_A");
+    try writeTestFile(tmp.dir, "home/work/src/a/a.zig", "");
+    try writeTestFile(tmp.dir, "home/work/src/b/b.zig", "");
+    try writeTestFile(tmp.dir, "home/work/other/o.zig", "");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
+    defer alloc.free(workspace);
+    const target_a = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work/src/a/a.zig");
+    defer alloc.free(target_a);
+    const target_b = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work/src/b/b.zig");
+    defer alloc.free(target_b);
+    const target_other = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work/other/o.zig");
+    defer alloc.free(target_other);
+
+    var initial = try gatherProjectContextWithHome(alloc, .{ .workspace_root = workspace }, home);
+    defer initial.deinit(alloc);
+    var first = try selectApplicableProjectContext(alloc, .{
+        .workspace_root = workspace,
+        .targets = &.{.{ .path = target_a, .kind = .file }},
+        .delivered_sources = initial.delivered_sources,
+        .evaluated_endpoints = initial.evaluated_endpoints,
+    });
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), first.delivered_sources.len);
+    // Nothing was delivered before, so the first selection reminds of nothing.
+    try std.testing.expect(first.reminders == null);
+
+    // The next turn: the first turn's note counts as delivered and may be
+    // reminded of; that turn's evaluated endpoints are not carried over.
+    var delivered: std.ArrayList([]const u8) = .empty;
+    defer delivered.deinit(alloc);
+    try delivered.appendSlice(alloc, initial.delivered_sources);
+    try delivered.appendSlice(alloc, first.delivered_sources);
+    var remindable: std.ArrayList([]const u8) = .empty;
+    defer remindable.deinit(alloc);
+    try remindable.appendSlice(alloc, first.delivered_sources);
+
+    var sibling = try selectApplicableProjectContext(alloc, .{
+        .workspace_root = workspace,
+        .targets = &.{.{ .path = target_b, .kind = .file }},
+        .delivered_sources = delivered.items,
+        .evaluated_endpoints = initial.evaluated_endpoints,
+        .remind_sources = remindable.items,
+    });
+    defer sibling.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), sibling.modelVisibleBytes().len);
+    try std.testing.expectEqualStrings(
+        "<scoped-rules-reminder from=\"src/AGENTS.md\" scope=\"src\">" ++ rule_reminder_text ++ "</scoped-rules-reminder>",
+        sibling.reminders orelse return error.TestExpectedReminder,
+    );
+    try std.testing.expectEqual(@as(usize, 1), sibling.reminded_sources.len);
+
+    var both = try selectApplicableProjectContext(alloc, .{
+        .workspace_root = workspace,
+        .targets = &.{.{ .path = target_a, .kind = .file }},
+        .delivered_sources = delivered.items,
+        .evaluated_endpoints = initial.evaluated_endpoints,
+        .remind_sources = remindable.items,
+    });
+    defer both.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), both.modelVisibleBytes().len);
+    try std.testing.expectEqualStrings(
+        "<scoped-rules-reminder from=\"src/AGENTS.md\" scope=\"src\">" ++ rule_reminder_text ++ "</scoped-rules-reminder>\n" ++
+            "<scoped-rules-reminder from=\"src/a/AGENTS.md\" scope=\"src/a\">" ++ rule_reminder_text ++ "</scoped-rules-reminder>",
+        both.reminders orelse return error.TestExpectedReminder,
+    );
+
+    var unrelated = try selectApplicableProjectContext(alloc, .{
+        .workspace_root = workspace,
+        .targets = &.{.{ .path = target_other, .kind = .file }},
+        .delivered_sources = delivered.items,
+        .evaluated_endpoints = initial.evaluated_endpoints,
+        .remind_sources = remindable.items,
+    });
+    defer unrelated.deinit(alloc);
+    try std.testing.expect(unrelated.reminders == null);
+
+    // Rules this turn already reminded of, or delivered this turn, are not
+    // in remind_sources and get no line.
+    var not_remindable = try selectApplicableProjectContext(alloc, .{
+        .workspace_root = workspace,
+        .targets = &.{.{ .path = target_a, .kind = .file }},
+        .delivered_sources = delivered.items,
+        .evaluated_endpoints = initial.evaluated_endpoints,
+    });
+    defer not_remindable.deinit(alloc);
+    try std.testing.expect(not_remindable.reminders == null);
+    try std.testing.expectEqual(@as(usize, 0), not_remindable.modelVisibleBytes().len);
 }
 
 test "later selection includes the target directory scope only for directory targets" {

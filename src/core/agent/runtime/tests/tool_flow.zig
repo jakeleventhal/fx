@@ -2764,6 +2764,29 @@ fn expectRulesOnLastToolResult(alloc: std.mem.Allocator, body: []const u8, rule:
     try std.testing.expect(std.mem.endsWith(u8, output, "</scoped-rules>"));
 }
 
+/// The request ends with a tool result whose text ends with the reminder
+/// line for `rules` in `scope`, and no system message follows the
+/// instructions.
+fn expectReminderOnLastToolResult(alloc: std.mem.Allocator, body: []const u8, rules: []const u8, scope: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    const prompt = parsed.object.get("prompt").?.array.items;
+    var in_conversation = false;
+    for (prompt) |message| {
+        const is_system = std.mem.eql(u8, message.object.get("role").?.string, "system");
+        if (!is_system) in_conversation = true;
+        try std.testing.expect(!(is_system and in_conversation));
+    }
+    const last = prompt[prompt.len - 1].object;
+    try std.testing.expectEqualStrings("tool", last.get("role").?.string);
+    const parts = last.get("content").?.array.items;
+    const output = parts[parts.len - 1].object.get("output").?.object.get("value").?.string;
+    const line = try arena.print("<scoped-rules-reminder from=\"{s}\" scope=\"{s}\">The rules fx added earlier for this folder still apply.</scoped-rules-reminder>", .{ rules, scope });
+    try std.testing.expect(std.mem.endsWith(u8, output, line));
+}
+
 test "rules a tool call reaches ride on the step's tool result and stay out of the instructions, for every model (D93)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2807,8 +2830,14 @@ test "rules a tool call reaches ride on the step's tool result and stay out of t
     try std.testing.expect(std.mem.startsWith(u8, saved.context_notes[0].text, "<scoped-rules from=\""));
 
     // Turn 2: the instructions do not rebuild the rules from the saved call,
-    // and a call that reaches the folder again does not deliver them again.
-    var second_gateway = FakeGateway.init(alloc, &completions);
+    // and a call that reaches the folder again does not deliver them again:
+    // its tool result ends with a reminder line instead. A later step that
+    // reaches the folder from another directory gets no second line.
+    try tmp.dir.createDirPath(std.testing.io, "workspace/nested/deeper");
+    const again = [_]ToolCall{toolCall("note_glob_again", "glob_files", "{\"pattern\":\"*\",\"path\":\"nested\"}")};
+    const deeper = [_]ToolCall{toolCall("note_glob_deeper", "glob_files", "{\"pattern\":\"*\",\"path\":\"nested/deeper\"}")};
+    const second_completions = [_]FakeCompletion{ .{ .tool_calls = &again }, .{ .tool_calls = &deeper }, .{ .content = "Final" } };
+    var second_gateway = FakeGateway.init(alloc, &second_completions);
     defer second_gateway.deinit();
     var second_hooks = FakeAgentRuntimeDeps.init(alloc);
     defer second_hooks.deinit();
@@ -2816,11 +2845,22 @@ test "rules a tool call reaches ride on the step's tool result and stay out of t
     second_hooks.context_registry = registry;
     job.history = first_hooks.history_turns.items;
     try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), job);
-    try std.testing.expectEqual(@as(usize, 2), second_gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 3), second_gateway.request_bodies.items.len);
     for (second_gateway.request_bodies.items) |body| {
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "NOTE_SCOPE_RULE"));
     }
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, second_gateway.request_bodies.items[0], "<scoped-rules-reminder"));
+    try expectReminderOnLastToolResult(alloc, second_gateway.request_bodies.items[1], "nested/AGENTS.md", "nested");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, second_gateway.request_bodies.items[2], "<scoped-rules-reminder"));
     try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], second_gateway.request_bodies.items[0]);
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], second_gateway.request_bodies.items[2]);
+    // The reminder is saved at its boundary without sources, so it never
+    // counts as delivering the file.
+    const second_saved = second_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), second_saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 1), second_saved.context_notes[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 0), second_saved.context_notes[0].sources.len);
+    try std.testing.expect(std.mem.startsWith(u8, second_saved.context_notes[0].text, "<scoped-rules-reminder from=\"nested/AGENTS.md\" scope=\"nested\">"));
 
     // Turn 3: after the file changes, the next call that reaches it delivers
     // the current rules in a new note that replaces the earlier copy.
@@ -2829,7 +2869,11 @@ test "rules a tool call reaches ride on the step's tool result and stay out of t
     defer both_turns.deinit(alloc);
     try both_turns.appendSlice(alloc, first_hooks.history_turns.items);
     try both_turns.appendSlice(alloc, second_hooks.history_turns.items);
-    var third_gateway = FakeGateway.init(alloc, &completions);
+    // Its second step reaches the folder again: rules this turn delivered
+    // get no reminder.
+    const deeper_again = [_]ToolCall{toolCall("note_glob_deeper_again", "glob_files", "{\"pattern\":\"*\",\"path\":\"nested/deeper\"}")};
+    const third_completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .tool_calls = &deeper_again }, .{ .content = "Final" } };
+    var third_gateway = FakeGateway.init(alloc, &third_completions);
     defer third_gateway.deinit();
     var third_hooks = FakeAgentRuntimeDeps.init(alloc);
     defer third_hooks.deinit();
@@ -2837,8 +2881,13 @@ test "rules a tool call reaches ride on the step's tool result and stay out of t
     third_hooks.context_registry = registry;
     job.history = both_turns.items;
     try runFakePrompt(&third_gateway, &third_hooks, fixture.config(), job);
-    try std.testing.expectEqual(@as(usize, 2), third_gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 3), third_gateway.request_bodies.items.len);
     try expectBodyNotContains(&third_gateway, 0, "NOTE_SCOPE_RULE_EDITED");
+    // The saved reminder rides on the same tool result again; the changed
+    // file is delivered in full, with no reminder for its old copy.
+    for (third_gateway.request_bodies.items) |body| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "<scoped-rules-reminder"));
+    }
     try expectRulesOnLastToolResult(alloc, third_gateway.request_bodies.items[1], "NOTE_SCOPE_RULE_EDITED");
     try expectRulesOnLastToolResult(alloc, third_gateway.request_bodies.items[1], "The rules below replace the earlier copy from the same file.");
     try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], third_gateway.request_bodies.items[1]);
