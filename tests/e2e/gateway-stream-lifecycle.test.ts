@@ -8704,7 +8704,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(gateway.requests[3]!.headers.get("ai-language-model-id")).toBe(smallModel);
       expect(gateway.requests[4]!.headers.get("ai-language-model-id")).toBe(MODEL);
       for (const catalog of [parentCatalog, childCatalog]) {
-        expect(catalog).toContain(resumedWorkspace);
+        // A root inside the workspace is shown relative to it.
+        expect(catalog).toContain("Root 0: .agents/skills\n");
         expect(catalog).not.toContain("original-workspace-only");
         for (const name of skillNames) expect(catalog).toContain(`- ${name}:`);
       }
