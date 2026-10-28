@@ -954,19 +954,27 @@ pub fn formatPersistedFileChangePayload(
     );
     // Captured rows and inline snapshots never coexist, so this never
     // replaces a full diff built above.
-    if (payload.full == null) {
-        if (presentation.review_lines) |rows| if (presentation.lifecycle_id) |lifecycle_id| {
-            payload.full = formatCapturedFullDiff(alloc, rows, lifecycle_id, styles) catch |err| blk: {
-                debug_trace.logf(
-                    "tool",
-                    "persisted file full diff formatting unavailable err={s}",
-                    .{@errorName(err)},
-                );
-                break :blk null;
-            };
-        };
-    }
+    if (payload.full == null) payload.full = capturedFullDiff(alloc, presentation, styles);
     return payload;
+}
+
+/// The full diff a presentation's captured rows restore, or null when it has
+/// none or they cannot be formatted, which leaves the preview.
+fn capturedFullDiff(
+    alloc: Allocator,
+    presentation: types.CommittedFilePresentation,
+    styles: FormatStyles,
+) ?FullDiff {
+    const rows = presentation.review_lines orelse return null;
+    const lifecycle_id = presentation.lifecycle_id orelse return null;
+    return formatCapturedFullDiff(alloc, rows, lifecycle_id, styles) catch |err| {
+        debug_trace.logf(
+            "tool",
+            "persisted file full diff formatting unavailable err={s}",
+            .{@errorName(err)},
+        );
+        return null;
+    };
 }
 
 pub fn formatFileChangeFullDiff(

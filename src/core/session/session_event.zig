@@ -3198,6 +3198,13 @@ test "conversation frame decoder stays bounded under fuzzed bytes" {
             "{}\n",
             "{\"schema_version\":1}\n",
             "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":0,\"event\":{\"assistant\":{\"text\":\"ok\"}}}\n",
+            // An edit's result with full-diff rows, so mutations reach their parsing.
+            "{\"schema_version\":3,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"tool_result\":{\"call_id\":\"call-edit\",\"tool_name\":\"edit_file\"," ++
+                "\"status\":\"success\",\"artifact_ref\":\"result.txt\",\"stored_bytes\":0,\"completeness\":\"complete\"," ++
+                "\"committed_file_presentation\":{\"path\":\"src/a.zig\",\"kind\":\"edited\",\"lines\":[],\"additions\":1,\"deletions\":1," ++
+                "\"truncated\":false,\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":{\"turn_id\":1,\"call_id\":\"call-edit\"}," ++
+                "\"content_handle\":null,\"review_lines\":[{\"kind\":\"elision\",\"old_line\":null,\"new_line\":null,\"text\":\"3 unchanged lines\"}," ++
+                "{\"kind\":\"deletion\",\"old_line\":4,\"new_line\":null,\"text\":\"old\"},{\"kind\":\"addition\",\"old_line\":null,\"new_line\":4,\"text\":\"new\"}]}}}}\n",
         }) ++ @import("fuzz_corpus").session_conversation_frame.*),
     });
 }
