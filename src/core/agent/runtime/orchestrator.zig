@@ -5661,6 +5661,31 @@ fn carryExplicitSkill(
     return boundary;
 }
 
+/// After an in-turn compaction keeps the turn's messages from `cut` on, a
+/// cut that covered the named skills' note at `note_index` adds it again
+/// where the kept messages start, so their text still rides on the turn's
+/// message and the instructions stay as they were (D95). Returns the note's
+/// index.
+fn keepExplicitSkillNote(
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    explicit: ?*const skill_invocation.ExplicitPromptSection,
+    note_index: ?usize,
+    cut: usize,
+) Allocator.Error!?usize {
+    const index = note_index orelse return null;
+    if (index >= cut) return index;
+    const section = explicit.?;
+    try within_turn_suffix.insert(arena, cut, .{
+        .role = .system,
+        .content = section.text,
+        .context_note = true,
+        .context_note_saved_text = section.used_note.?,
+    });
+    debug_trace.logf("skills", "explicit skill note added again after compaction index={d}", .{cut});
+    return cut;
+}
+
 fn prepareSkillCatalog(
     alloc: Allocator,
     deps: *const AgentRuntimeDeps,
@@ -6335,7 +6360,7 @@ fn appendStablePromptContext(
     }
     // The session-start project rules; rules a tool call reaches later ride
     // on its tool result instead (D93).
-    if (deps.append_static_context) |append| try append(deps.ctx, alloc, null, messages);
+    if (deps.append_static_context) |append| try append(deps.ctx, alloc, messages);
     // The skill catalog and project rules name workspace paths. A breakpoint
     // at the end of the stable instructions keeps them cached when only the
     // per-step turn context after them changes (PromptCache.tla
@@ -7764,23 +7789,7 @@ fn processQueuedPromptLoop(
                             .steering = outcome.cut.steering,
                         } else .{};
                         compacted_suffix_len += try runtime_execution_memory.retainedMessageOffset(within_turn_suffix.items[compacted_suffix_len..], active_cut);
-                        // A cut that covers the named skills' note adds it
-                        // again where the kept messages start, so their text
-                        // still rides on the turn's message and the
-                        // instructions stay as they were (D95).
-                        if (explicit_note_index) |index| {
-                            if (index < compacted_suffix_len) {
-                                const section = skills.explicit.?;
-                                try within_turn_suffix.insert(arena, compacted_suffix_len, .{
-                                    .role = .system,
-                                    .content = section.text,
-                                    .context_note = true,
-                                    .context_note_saved_text = section.used_note.?,
-                                });
-                                explicit_note_index = compacted_suffix_len;
-                                debug_trace.logf("skills", "explicit skill note added again after compaction index={d}", .{compacted_suffix_len});
-                            }
-                        }
+                        explicit_note_index = try keepExplicitSkillNote(arena, &within_turn_suffix, skills.explicit, explicit_note_index, compacted_suffix_len);
                         var retained_messages: std.ArrayList(ChatMessage) = .empty;
                         try session_runtime.appendHistoryChatMessages(arena, &retained_messages, outcome.retained_history);
                         try projectEmptyHistoryReplay(arena, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, retained_messages.items);

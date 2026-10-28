@@ -175,7 +175,7 @@ fn nextConversationTurnOpen(open: bool, event: session_event.ConversationEvent) 
         .assistant, .tool_call, .tool_result, .steering => if (open) true else error.InvalidConversationFrame,
         .context_checkpoint => open,
         // v1 logs never hold a context note or runtime context; only a v2
-        // session saves them (D93, D94).
+        // session saves them (D93, D94). Every v1 reader below refuses both.
         .context_note, .runtime_context => error.InvalidConversationFrame,
     };
 }
@@ -886,8 +886,6 @@ fn replayConversationHistory(
             .tool_call => |value| try turn.appendToolCall(value),
             .tool_result => |value| try turn.appendToolResult(value),
             .steering => |value| try turn.appendSteering(value.text),
-            // v1 logs never hold a context note or runtime context; only a v2
-            // session saves them (D93, D94).
             .context_note, .runtime_context => return error.InvalidConversationFrame,
             .turn_completed => |value| {
                 const completed = try turn.finishAssistant(value);
@@ -980,8 +978,6 @@ const ConversationHistoryReader = struct {
                     try self.builder.appendSteering(value.text);
                     break :blk null;
                 },
-                // v1 logs never hold a context note or runtime context; only a
-                // v2 session saves them (D93, D94).
                 .context_note, .runtime_context => return error.InvalidConversationFrame,
                 .turn_completed => |value| try self.builder.finishAssistant(value),
                 .interrupted => |value| try self.builder.finishInterrupted(value),
@@ -1087,8 +1083,6 @@ fn load_conversation_archive_from_source(
                 try builder.appendSteering(value.text);
                 break :blk null;
             },
-            // v1 logs never hold a context note or runtime context; only a v2
-            // session saves them (D93, D94).
             .context_note, .runtime_context => return error.InvalidConversationFrame,
             .turn_completed => |value| try builder.finishAssistant(value),
             .interrupted => |value| try builder.finishInterrupted(value),
@@ -1164,8 +1158,6 @@ const ConversationReplayScan = struct {
                     .coverage = checkpoint.covers_through_seq,
                 };
             },
-            // v1 logs never hold a context note or runtime context; only a v2
-            // session saves them (D93, D94).
             .context_note, .runtime_context => return error.InvalidConversationFrame,
             else => {},
         }
