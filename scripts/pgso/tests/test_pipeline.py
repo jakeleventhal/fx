@@ -7,7 +7,24 @@ import pathlib
 import tempfile
 import unittest
 
+from scripts.pgso import macos
 from scripts.pgso.model import PgsoError, sha256_file
+from scripts.pgso.macos import (
+    CandidateMetadata,
+    MacosLinkContract,
+    PROFILE_SECTION_ALIGNMENTS,
+    apple_ld_system_stub,
+    candidate_link_argv,
+    candidate_runtime_probe_argv,
+    instrumented_link_argv,
+    map_temporal_symbols,
+    order_outlined_ir_helpers,
+    parse_macos_link_contract,
+    temporal_candidate_link_argv,
+    validate_candidate_metadata,
+    validate_profile_section_alignment,
+    validate_temporal_link_map,
+)
 from scripts.pgso.pipeline import (
     BENCHMARK_USE_FLAGS,
     FX_MACHINE_OUTLINER_FLAGS,
@@ -16,39 +33,25 @@ from scripts.pgso.pipeline import (
     OUTLINE_CLEANUP_FLAGS,
     OUTLINE_PARTITIONS,
     PROFILE_PREPARATION_PASSES,
-    PROFILE_SECTION_ALIGNMENTS,
     USE_FLAGS,
     ArtifactSpec,
-    CandidateMetadata,
-    MacosLinkContract,
     PipelinePaths,
     apply_profile,
-    apple_ld_system_stub,
     cleanup_outlined_ir_argv,
     candidate_object_argv,
-    candidate_link_argv,
-    candidate_runtime_probe_argv,
     emit_bitcode,
-    temporal_candidate_link_argv,
-    map_temporal_symbols,
-    parse_macos_link_contract,
-    validate_temporal_link_map,
     instrumentation_argv,
     instrumented_run_argv,
-    instrumented_link_argv,
     link_outlined_ir_argv,
     link_candidate,
     merge_profile_batch,
     parse_compiler_runtime,
     outline_ir_argv,
-    order_outlined_ir_helpers,
     profile_use_argv,
     reject_profile_outputs,
     validate_archive_unchanged,
     validate_bitcode_hash,
-    validate_candidate_metadata,
     validate_candidate_size,
-    validate_profile_section_alignment,
     split_ir_argv,
     verify_release_safe_ir,
     zig_build_argv,
@@ -189,10 +192,10 @@ class PgsoPipelineTests(unittest.TestCase):
     def test_temporal_link_preserves_the_control_platform_and_original_object(self) -> None:
         runtime = self.root / "libcompiler_rt_zcu.o"
         contract = MacosLinkContract(1, "13.3", "26.4", 16 * 1024 * 1024, ())
-        toolchain = dataclasses.replace(self.toolchain, sdk_version="15.5")
+        toolchain = self.replace_toolchain(sdk_version="15.5")
         stub = self.root / "linked" / "libSystem.tbd"
         command = temporal_candidate_link_argv(toolchain, self.paths, runtime, contract, stub)
-        self.assertEqual(str(self.toolchain.apple_ld), command[0])
+        self.assertEqual(str(self.toolchain.tools.apple_ld), command[0])
         platform = command.index("-platform_version")
         self.assertEqual(("macos", "13.3", "26.4"), command[platform + 1:platform + 4])
         self.assertIn(str(self.paths.profile_use_object), command)
@@ -201,7 +204,7 @@ class PgsoPipelineTests(unittest.TestCase):
         self.assertNotIn(str(self.toolchain.profile_runtime), command)
         self.assertEqual("1000000", command[command.index("-stack_size") + 1])
         self.assertIn(str(stub), command)
-        self.assertNotIn(str(toolchain.zig_darwin_sdk / "libSystem.tbd"), command)
+        self.assertNotIn(str(toolchain.tools.zig_darwin_sdk / "libSystem.tbd"), command)
         self.assertIn(str(self.paths.logs / "candidate-order.txt"), command)
         for flag in (
             "-order_file",
@@ -255,16 +258,19 @@ class PgsoPipelineTests(unittest.TestCase):
             "clang": tool_root / "clang",
             "libllvm": self.root / "libLLVM.dylib",
             "ir_size": tool_root / "ir_size.py",
-            "apple_ld": tool_root / "ld",
-            "apple_ld_version": "1167.5",
-            "strip": tool_root / "strip",
-            "codesign": tool_root / "codesign",
-            "otool": tool_root / "otool",
-            "xcrun": tool_root / "xcrun",
-            "sdk": self.root / "MacOSX.sdk",
-            "sdk_version": "26.4",
-            "zig_darwin_sdk": self.root / "ZigDarwin.sdk",
-            "zig_sdk_version": "26.4",
+            "platform": macos,
+            "tools": macos.Tools(
+                apple_ld=tool_root / "ld",
+                apple_ld_version="1167.5",
+                strip=tool_root / "strip",
+                codesign=tool_root / "codesign",
+                otool=tool_root / "otool",
+                xcrun=tool_root / "xcrun",
+                sdk=self.root / "MacOSX.sdk",
+                sdk_version="26.4",
+                zig_darwin_sdk=self.root / "ZigDarwin.sdk",
+                zig_sdk_version="26.4",
+            ),
             "profile_runtime": self.root / "libclang_rt.profile_osx.a",
             "zig_version": "0.17.0",
             "llvm_version": "22.1.8",
@@ -273,6 +279,17 @@ class PgsoPipelineTests(unittest.TestCase):
         }
         defaults.update(changes)
         return Toolchain(**defaults)
+
+    def replace_toolchain(self, **changes: object) -> Toolchain:
+        """`self.toolchain` with `changes`; macOS tool fields go to its tools."""
+        tool_fields = {field.name for field in dataclasses.fields(macos.Tools)}
+        tools = {name: value for name, value in changes.items() if name in tool_fields}
+        shared = {name: value for name, value in changes.items() if name not in tool_fields}
+        return dataclasses.replace(
+            self.toolchain,
+            tools=dataclasses.replace(self.toolchain.tools, **tools),
+            **shared,
+        )
 
     def write_executable(self, name: str, body: str) -> pathlib.Path:
         path = self.root / name
@@ -445,9 +462,12 @@ print('{{}}')""",
         self.assertEqual(
             (
                 "-passes=internalize,constmerge,globaldce,mergefunc,verify",
-                "-internalize-public-api-list=main,_mh_execute_header",
             ),
             OUTLINE_CLEANUP_FLAGS,
+        )
+        self.assertEqual(
+            ("-internalize-public-api-list=main,_mh_execute_header",),
+            macos.public_api_flags(self.toolchain, self.paths),
         )
         self.assertEqual(2, OUTLINE_PARTITIONS)
         self.assertEqual(
@@ -549,7 +569,8 @@ print('{{}}')""",
         self.assertEqual(
             (
                 str(self.toolchain.opt),
-                *OUTLINE_CLEANUP_FLAGS,
+                "-passes=internalize,constmerge,globaldce,mergefunc,verify",
+                "-internalize-public-api-list=main,_mh_execute_header",
                 str(self.paths.linked_outlined_bitcode),
                 "-o",
                 str(self.paths.profile_use_bitcode),
@@ -660,7 +681,7 @@ print('{{}}')""",
         for alignment in PROFILE_SECTION_ALIGNMENTS:
             self.assertIn(alignment, instrumented)
         self.assertIn("-mmacosx-version-min=13.0", instrumented)
-        self.assertIn(str(self.toolchain.sdk), instrumented)
+        self.assertIn(str(self.toolchain.tools.sdk), instrumented)
         self.assertIn(str(self.toolchain.profile_runtime), instrumented)
         self.assertEqual(
             (
@@ -686,8 +707,8 @@ print('{{}}')""",
         actions = self.root / "candidate-actions.txt"
         runtime = self.root / "libcompiler_rt.a"
         runtime.write_bytes(b"compiler runtime")
-        self.toolchain.zig_darwin_sdk.mkdir()
-        (self.toolchain.zig_darwin_sdk / "libSystem.tbd").write_bytes(b"system stub")
+        self.toolchain.tools.zig_darwin_sdk.mkdir()
+        (self.toolchain.tools.zig_darwin_sdk / "libSystem.tbd").write_bytes(b"system stub")
         (self.paths.compiler_runtime / "instrumented.o").write_bytes(b"instrumented runtime")
         self.paths.merged_profile.write_bytes(b"temporal profile")
         self.paths.control_binary.parent.mkdir(parents=True)
@@ -754,8 +775,7 @@ with pathlib.Path({str(actions)!r}).open('a') as stream:
 pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')
 pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.encode() + b'\\x89 literal data\\n')""",
         )
-        toolchain = dataclasses.replace(
-            self.toolchain,
+        toolchain = self.replace_toolchain(
             zig=zig,
             otool=otool,
             apple_ld=linker,
@@ -828,8 +848,8 @@ pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.enco
 pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')""",
         )
         noop = self.write_executable("noop", "pass")
-        toolchain = dataclasses.replace(
-            self.toolchain, zig=artifact, opt=artifact, llc=artifact,
+        toolchain = self.replace_toolchain(
+            zig=artifact, opt=artifact, llc=artifact,
             strip=noop, codesign=noop,
         )
         paths.profile_use_bitcode.write_bytes(b'bitcode')

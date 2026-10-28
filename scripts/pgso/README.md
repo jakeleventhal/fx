@@ -19,6 +19,8 @@ The driver requires:
 
 The pipeline does not use the host CPU as the release target. The final candidate must match the control's architecture, minimum macOS version, SDK compatibility stamp, main-stack request, and dynamic-library dependency versions. It must contain a valid code signature, contain no profile sections or profile-runtime dependency, and produce no profile output when executed.
 
+The target-specific steps live in a platform module, which [`platforms.py`](platforms.py) selects for the requested target: the host check, native tools, the instrumented and candidate links, the control properties the candidate must match, and the candidate's layout checks. [`macos.py`](macos.py) is the only platform. The profile, outlining, corpus, and measurement stages are shared.
+
 Training records execution counts and first-use function timestamps in the same
 continuous profiles. Counter supplements preserve the temporal traces. The
 main PGSO executable uses LLVM's temporal function order through the native
