@@ -2909,6 +2909,52 @@ test "rules a tool call reaches ride on the step's tool result and stay out of t
     try std.testing.expectEqual(@as(usize, 1), plain_hooks.history_turns.items[0].assistant.execution.context_notes.len);
 }
 
+test "an edit to the file a symlinked AGENTS.md names is delivered on a later turn (D93)" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/nested");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/CLAUDE.md", .data = "LINKED_RULE_V1" });
+    tmp.dir.symLink(std.testing.io, "CLAUDE.md", "workspace/nested/AGENTS.md", .{ .is_directory = false }) catch |err| {
+        if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
+        return err;
+    };
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
+    const calls = [_]ToolCall{toolCall("link_glob", "glob_files", "{\"pattern\":\"*\",\"path\":\"nested\"}")};
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Final" } };
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var job = fixture.job();
+    job.model = @constCast("anthropic/claude-sonnet-5.5");
+    job.permission_mode = .auto;
+
+    var first_gateway = FakeGateway.init(alloc, &completions);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.context_enabled = true;
+    first_hooks.context_registry = registry;
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), job);
+    try expectRulesOnLastToolResult(alloc, first_gateway.request_bodies.items[1], "LINKED_RULE_V1");
+
+    // The link stays as it was; only the file it names changes.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/CLAUDE.md", .data = "LINKED_RULE_V2" });
+    var second_gateway = FakeGateway.init(alloc, &completions);
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    second_hooks.context_enabled = true;
+    second_hooks.context_registry = registry;
+    job.history = first_hooks.history_turns.items;
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 2), second_gateway.request_bodies.items.len);
+    try expectRulesOnLastToolResult(alloc, second_gateway.request_bodies.items[1], "LINKED_RULE_V2");
+    try expectRulesOnLastToolResult(alloc, second_gateway.request_bodies.items[1], "The rules below replace the earlier copy from the same file.");
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, second_gateway.request_bodies.items[1], "<scoped-rules-reminder"));
+}
+
 /// The text of each user message in a Gateway request body, in order.
 fn userMessageTexts(alloc: std.mem.Allocator, body: []const u8) !std.ArrayList([]const u8) {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, body, .{});

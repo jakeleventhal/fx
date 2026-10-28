@@ -2511,7 +2511,7 @@ fn advertiseUnselectedMcpCalls(
     const resolve = deps.resolve_unselected_mcp_tool orelse return;
     for (calls) |call| {
         if (deps.tool_registry.lookup(call.name) != null) continue;
-        if (containsToolName(advertised_names.*, call.name)) continue;
+        if (containsString(advertised_names.*, call.name)) continue;
         const resolved = resolve(deps.ctx, arena, call.name) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
@@ -2537,11 +2537,21 @@ fn advertiseUnselectedMcpCalls(
     }
 }
 
-fn containsToolName(names: []const []const u8, name: []const u8) bool {
-    for (names) |candidate| {
-        if (std.mem.eql(u8, candidate, name)) return true;
+fn containsString(items: []const []const u8, item: []const u8) bool {
+    for (items) |candidate| {
+        if (std.mem.eql(u8, candidate, item)) return true;
     }
     return false;
+}
+
+/// Removes the first copy of `item` from `list`, keeping the order.
+fn removeString(list: *std.ArrayList([]const u8), item: []const u8) void {
+    for (list.items, 0..) |candidate, index| {
+        if (std.mem.eql(u8, candidate, item)) {
+            _ = list.orderedRemove(index);
+            return;
+        }
+    }
 }
 
 fn prepareDeferredDynamicCandidate(
@@ -2675,35 +2685,21 @@ pub const TestHooks = if (builtin.is_test) struct {
     pub var context_gate_commit: ?*const fn () Allocator.Error!void = null;
 } else struct {};
 
-/// A stamp of an instruction file's size, modification time, and inode, so a
-/// later turn can tell whether the file changed since a note delivered it.
-/// Never 0; returns 0 when the file cannot be read (D93).
-fn noteSourceStamp(path: []const u8) u64 {
-    const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch return 0;
-    var hasher = std.hash.Wyhash.init(0);
-    const fields = [_]u64{
-        stat.size,
-        @bitCast(@as(i64, @truncate(stat.mtime.nanoseconds))),
-        @intCast(stat.inode),
-    };
-    hasher.update(std.mem.sliceAsBytes(&fields));
-    // 53 bits stay exact for any JSON reader of the saved session.
-    return (hasher.final() & ((@as(u64, 1) << 53) - 1)) | 1;
-}
-
 const replaced_rules_preface = "The rules below replace the earlier copy from the same file.\n\n";
 
 /// The notes design's commit (D93): records the delivery and queues the
 /// selected rules as a context note, which joins the turn after this step's
 /// results. Takes `selected.content`. The note keeps each delivered file with
-/// its stamp, so a later turn counts an unchanged file as delivered. When a
-/// file changed since an earlier note, the note says it replaces that copy.
-/// Reminders for rules an earlier turn delivered follow in a note of their
-/// own, without sources, and leave `remind_sources` for this turn.
+/// its stamp from `instruction_files`, which read it, so a later turn counts
+/// an unchanged file as delivered. When a file changed since an earlier note,
+/// the note says it replaces that copy. Reminders for rules an earlier turn
+/// delivered follow in a note of their own, without sources, and leave
+/// `remind_sources` for this turn.
 fn commitContextNote(
     arena: Allocator,
     pending_notes: *std.ArrayList(ChatMessage),
     context_delivery_state: *context_contract.DeliveryState,
+    instruction_files: context_contract.InstructionFiles,
     selected: *context_contract.ProviderContext,
     replaced_sources: []const []const u8,
     remind_sources: *std.ArrayList([]const u8),
@@ -2712,21 +2708,14 @@ fn commitContextNote(
         if (TestHooks.context_gate_commit) |hook| try hook();
     }
     if (selected.content != null) {
-        try commitRulesNote(arena, pending_notes, context_delivery_state, selected, replaced_sources);
+        try commitRulesNote(arena, pending_notes, context_delivery_state, instruction_files, selected, replaced_sources);
     } else {
         try context_delivery_state.commit(arena, selected);
     }
     const reminders = selected.reminders orelse return;
     try pending_notes.append(arena, .{ .role = .system, .content = reminders, .context_note = true });
     selected.reminders = null;
-    for (selected.reminded_sources) |source| {
-        for (remind_sources.items, 0..) |candidate, index| {
-            if (std.mem.eql(u8, candidate, source)) {
-                _ = remind_sources.orderedRemove(index);
-                break;
-            }
-        }
-    }
+    for (selected.reminded_sources) |source| removeString(remind_sources, source);
     debug_trace.logf("context", "rule reminder queued sources={d} remaining={d}", .{ selected.reminded_sources.len, remind_sources.items.len });
 }
 
@@ -2734,6 +2723,7 @@ fn commitRulesNote(
     arena: Allocator,
     pending_notes: *std.ArrayList(ChatMessage),
     context_delivery_state: *context_contract.DeliveryState,
+    instruction_files: context_contract.InstructionFiles,
     selected: *context_contract.ProviderContext,
     replaced_sources: []const []const u8,
 ) Allocator.Error!void {
@@ -2741,8 +2731,8 @@ fn commitRulesNote(
     const sources = try arena.alloc(types.ContextNoteSource, selected.delivered_sources.len);
     var replaces = false;
     for (selected.delivered_sources, sources) |source, *dest| {
-        dest.* = .{ .path = try arena.dupe(u8, source), .stamp = noteSourceStamp(source) };
-        if (containsPath(replaced_sources, source)) replaces = true;
+        dest.* = .{ .path = try arena.dupe(u8, source), .stamp = instruction_files.sourceStamp(arena, source) };
+        if (containsString(replaced_sources, source)) replaces = true;
     }
     const text = if (replaces) try std.mem.concat(arena, u8, &.{ replaced_rules_preface, content }) else content;
     try pending_notes.ensureUnusedCapacity(arena, 1);
@@ -2756,24 +2746,19 @@ fn commitRulesNote(
     selected.content = null;
 }
 
-fn containsPath(paths: []const []const u8, path: []const u8) bool {
-    for (paths) |candidate| {
-        if (std.mem.eql(u8, candidate, path)) return true;
-    }
-    return false;
-}
-
 /// Counts each instruction file a saved note delivered as delivered when the
-/// file has not changed since, so the gate does not deliver it again (D93).
-/// A changed or missing file goes to `replaced` instead, and the next tool
-/// call that reaches it delivers its current rules in a new note. A note a
-/// compaction dropped is not counted either. Files an earlier turn's note
-/// delivered also go to `remindable`; the recovered turn's own notes do not.
+/// file has not changed since, by its stamp from `instruction_files`, so the
+/// gate does not deliver it again (D93). A changed or missing file goes to
+/// `replaced` instead, and the next tool call that reaches it delivers its
+/// current rules in a new note. A note a compaction dropped is not counted
+/// either. Files an earlier turn's note delivered also go to `remindable`;
+/// the recovered turn's own notes do not.
 fn seedNoteDeliveredSources(
     arena: Allocator,
     state: *context_contract.DeliveryState,
     replaced: *std.ArrayList([]const u8),
     remindable: *std.ArrayList([]const u8),
+    instruction_files: context_contract.InstructionFiles,
     history: []const types.HistoryTurn,
     recovery: ?types.ExecutionMemory,
 ) Allocator.Error!void {
@@ -2783,9 +2768,9 @@ fn seedNoteDeliveredSources(
             .interrupted => |entry| entry.execution,
             .compacted_summary => continue,
         };
-        try seedNoteSources(arena, state, replaced, remindable, execution.context_notes);
+        try seedNoteSources(arena, state, replaced, remindable, instruction_files, execution.context_notes);
     }
-    if (recovery) |execution| try seedNoteSources(arena, state, replaced, null, execution.context_notes);
+    if (recovery) |execution| try seedNoteSources(arena, state, replaced, null, instruction_files, execution.context_notes);
 }
 
 fn seedNoteSources(
@@ -2793,31 +2778,26 @@ fn seedNoteSources(
     state: *context_contract.DeliveryState,
     replaced: *std.ArrayList([]const u8),
     remindable: ?*std.ArrayList([]const u8),
+    instruction_files: context_contract.InstructionFiles,
     notes: []const types.PersistedContextNote,
 ) Allocator.Error!void {
     for (notes) |note| for (note.sources) |source| {
-        const current = noteSourceStamp(source.path);
-        if (source.stamp != 0 and source.stamp == current) {
-            // A later note delivered this file again after it changed.
-            for (replaced.items, 0..) |path, i| {
-                if (std.mem.eql(u8, path, source.path)) {
-                    _ = replaced.orderedRemove(i);
-                    break;
-                }
-            }
-            if (!containsPath(state.delivered_sources.items, source.path)) {
-                try state.delivered_sources.append(arena, try arena.dupe(u8, source.path));
-            }
-            if (remindable) |list| {
-                if (!containsPath(list.items, source.path)) try list.append(arena, try arena.dupe(u8, source.path));
-            }
+        const current = instruction_files.sourceStamp(arena, source.path);
+        if (source.stamp == 0 or source.stamp != current) {
+            debug_trace.logf("context", "context note source not counted as delivered reason={s} path={s}", .{
+                if (current == 0) "missing" else "changed",
+                source.path,
+            });
+            if (!containsString(replaced.items, source.path)) try replaced.append(arena, try arena.dupe(u8, source.path));
             continue;
         }
-        debug_trace.logf("context", "context note source not counted as delivered reason={s} path={s}", .{
-            if (current == 0) "missing" else "changed",
-            source.path,
-        });
-        if (!containsPath(replaced.items, source.path)) try replaced.append(arena, try arena.dupe(u8, source.path));
+        // A later note delivered this file again after it changed.
+        removeString(replaced, source.path);
+        if (!containsString(state.delivered_sources.items, source.path)) {
+            try state.delivered_sources.append(arena, try arena.dupe(u8, source.path));
+        }
+        const list = remindable orelse continue;
+        if (!containsString(list.items, source.path)) try list.append(arena, try arena.dupe(u8, source.path));
     };
 }
 
@@ -6952,11 +6932,13 @@ fn processQueuedPromptLoop(
     // Files an earlier turn's notes delivered: the first tool call this turn
     // that reaches one again gets a reminder line in place of the rules.
     var remind_sources: std.ArrayList([]const u8) = .empty;
-    if (deps.context_enabled) try seedNoteDeliveredSources(
+    // Without a registry the gate never runs, so nothing is seeded.
+    if (deps.context_enabled) if (deps.context_registry) |registry| try seedNoteDeliveredSources(
         arena,
         &context_delivery_state,
         &replaced_note_sources,
         &remind_sources,
+        registry.instruction_files,
         job.history,
         if (job.recovery_checkpoint) |checkpoint| checkpoint.execution else null,
     );
@@ -10223,7 +10205,7 @@ fn processQueuedPromptLoop(
                 return;
             }
 
-            commitContextNote(arena, &pending_context_notes, &context_delivery_state, &selected, replaced_note_sources.items, &remind_sources) catch |err| {
+            commitContextNote(arena, &pending_context_notes, &context_delivery_state, context_registry.instruction_files, &selected, replaced_note_sources.items, &remind_sources) catch |err| {
                 return settleFailedContextGate(
                     deps,
                     &stream_ctx.provisional_statuses,
