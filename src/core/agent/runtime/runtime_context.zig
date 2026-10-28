@@ -11,14 +11,15 @@
 
 const std = @import("std");
 const types = @import("../../shared/types.zig");
+const model_context_encoding = @import("../../shared/model_context_encoding.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
 /// Opens an update note. Tool output cannot open one: the request escapes
-/// the tag there (`src/core/agent/stream_provider.zig`).
-pub const update_open_tag = "<fx-context-update>";
-const update_close_tag = "</fx-context-update>";
+/// the tag there (`model_context_encoding.writeCarriedEscaped`).
+pub const update_open_tag = "<" ++ model_context_encoding.context_update_tag ++ ">";
+const update_close_tag = "</" ++ model_context_encoding.context_update_tag ++ ">";
 const update_preface =
     "The runtime context changed during this session. These blocks replace the turn context and runtime notes in the instructions above, and any earlier update:\n";
 
