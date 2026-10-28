@@ -1425,7 +1425,7 @@ const App = struct {
             0,
             false,
         );
-        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        errdefer self.releaseUnadmittedPrompt(queued);
         try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
         return true;
@@ -1448,10 +1448,17 @@ const App = struct {
             turn_id,
             user_prompt_already_presented,
         );
-        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        errdefer self.releaseUnadmittedPrompt(queued);
         try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
         return true;
+    }
+
+    /// Frees a prompt the worker refused, giving back the stale shell handles
+    /// note it took so the next prompt carries it.
+    fn releaseUnadmittedPrompt(self: *App, queued: worker_runtime.QueuedPrompt) void {
+        if (queued.stale_shell_handles) self.session.returnStaleShellHandles(queued.turn_id);
+        worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
     }
 
     // Caller owns the returned prompt until worker admission succeeds.

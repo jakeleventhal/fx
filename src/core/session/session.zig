@@ -1419,6 +1419,14 @@ pub const SessionRuntime = struct {
         return self.has_stale_shell_handles;
     }
 
+    /// Gives the stale shell handles note back when the prompt that took it
+    /// is dropped before its turn runs: removed from the queue, or refused
+    /// at admission. The next prompt carries it instead.
+    pub fn returnStaleShellHandles(self: *SessionRuntime, turn_id: u64) void {
+        self.has_stale_shell_handles = true;
+        debug_trace.logf("session", "stale shell handles note returned from dropped prompt turn_id={d}", .{turn_id});
+    }
+
     pub fn reset(self: *SessionRuntime, alloc: Allocator) void {
         self.clearWebFetchArtifacts();
         self.clearPermissionState(alloc);
@@ -3573,6 +3581,11 @@ test "SessionRuntime restore and reset clear stale shell handle state" {
     runtime.has_stale_shell_handles = true;
     try std.testing.expect(runtime.takeStaleShellHandles());
     try std.testing.expect(!runtime.takeStaleShellHandles());
+    try std.testing.expect(!runtime.has_stale_shell_handles);
+
+    // A prompt dropped before its turn ran gives the note to the next one.
+    runtime.returnStaleShellHandles(7);
+    try std.testing.expect(runtime.takeStaleShellHandles());
     try std.testing.expect(!runtime.has_stale_shell_handles);
 }
 
