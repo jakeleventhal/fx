@@ -23,8 +23,9 @@ pub const Digest = [Sha256.digest_length]u8;
 // remain readable.
 //
 // CommittedFilePresentation.review_lines came after the last release that
-// wrote these frames, so no frame of any version carries it; the field is
-// optional and only the session store's pieces hold it.
+// wrote these frames, so no frame of any version carries it. The session
+// store keeps an edit's rows in a file_review item of their own, which older
+// fx versions skip, never inside the tool_result piece they read.
 pub const conversation_schema_version: u8 = 3;
 
 /// Every historical frame version a reader must still accept. Writers always
@@ -366,9 +367,7 @@ pub fn validateConversationEventShape(event: ConversationEvent, schema_version: 
                 if (presentation.content_handle) |handle| {
                     try validateConversationIdentity(handle);
                 }
-                if (presentation.review_lines) |rows| {
-                    for (rows) |row| try validateOptionalConversationText(row.text);
-                }
+                if (presentation.review_lines) |rows| try validateReviewLines(rows);
             }
             if ((result.command_replay_ref == null) !=
                 (result.command_replay_bytes == null))
@@ -432,6 +431,22 @@ fn validateConversationIdentity(value: []const u8) ConversationTransitionError!v
     if (types.ConversationIdentity.invalidReason(value) != null) {
         return rejectInvalidConversationEvent("identity");
     }
+}
+
+/// Checks a saved edit's full-diff rows and the identities they belong to,
+/// as a tool result's presentation would carry them.
+pub fn validateCommittedFileReview(
+    call_id: []const u8,
+    lifecycle_id: types.ToolLifecycleId,
+    rows: []const types.CommittedFilePresentationLine,
+) ConversationTransitionError!void {
+    try validateConversationIdentity(call_id);
+    try validateConversationIdentity(lifecycle_id.call_id);
+    try validateReviewLines(rows);
+}
+
+fn validateReviewLines(rows: []const types.CommittedFilePresentationLine) ConversationTransitionError!void {
+    for (rows) |row| try validateOptionalConversationText(row.text);
 }
 
 fn findPendingToolCall(

@@ -7828,8 +7828,12 @@ for (const inspectDetails of [false, true]) {
         expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
         const events = savedItems(home, sessionId);
         expect(events.filter(event => event.tool_result?.call_id === "write-second")).toHaveLength(1);
-        expect(events.find(event => event.tool_result?.call_id === "write-receipt").tool_result.committed_file_presentation.lifecycle_id)
+        // The write's full diff is saved beside its result, with its lifecycle
+        // id, and the result keeps the preview-only shape older fx versions read.
+        expect(events.find(event => event.file_review?.call_id === "write-receipt").file_review.lifecycle_id)
           .toEqual({ turn_id: 2, call_id: "write-receipt" });
+        expect(events.find(event => event.tool_result?.call_id === "write-receipt").tool_result.committed_file_presentation.lifecycle_id)
+          .toBeNull();
         expect(events.some(event => event.assistant?.text === savedReply)).toBe(true);
       } finally {
         if (active) await active.kill();

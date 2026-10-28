@@ -3432,7 +3432,7 @@ fn parseCommittedFilePresentation(
         "after_content",
         "lifecycle_id",
     };
-    // A handle came with externalized snapshots; rows came with schema 4.
+    // A handle came with externalized snapshots, and rows came after them.
     const object = try exactObjectWithOptionalKeys(
         value,
         &presentation_legacy_keys,
@@ -4888,15 +4888,22 @@ test "committed file presentation codec round trips captured review rows" {
         }
     }
 
-    // Rows are the only content source they can appear with.
-    const rows_with_handle =
-        "{\"path\":\"lock.yaml\",\"kind\":\"edited\",\"lines\":[],\"additions\":1,\"deletions\":1,\"truncated\":false,\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"content_handle\":\"diff-0123456789abcdef-0123456789abcdef.json\",\"review_lines\":[]}";
-    var competing_parsed = try std.json.parseFromSlice(std.json.Value, alloc, rows_with_handle, .{});
-    defer competing_parsed.deinit();
-    try std.testing.expectError(
-        error.InvalidSessionFormat,
-        parseCommittedFilePresentation(alloc, competing_parsed.value),
-    );
+    // Rows are the only content source they can appear with, and each row
+    // has a known kind.
+    const head = "{\"path\":\"lock.yaml\",\"kind\":\"edited\",\"lines\":[],\"additions\":1,\"deletions\":1,\"truncated\":false,";
+    const rejected = [_][]const u8{
+        head ++ "\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"content_handle\":\"diff-0123456789abcdef-0123456789abcdef.json\",\"review_lines\":[]}",
+        head ++ "\"previous_content\":\"old\",\"after_content\":\"new\",\"lifecycle_id\":null,\"review_lines\":[]}",
+        head ++ "\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"review_lines\":[{\"kind\":\"moved\",\"old_line\":null,\"new_line\":null,\"text\":\"x\"}]}",
+    };
+    for (rejected) |bytes| {
+        var competing_parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+        defer competing_parsed.deinit();
+        try std.testing.expectError(
+            error.InvalidSessionFormat,
+            parseCommittedFilePresentation(alloc, competing_parsed.value),
+        );
+    }
 
     // A presentation without rows keeps the shipped shape.
     var without_rows = captured;

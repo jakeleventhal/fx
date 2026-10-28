@@ -1039,7 +1039,7 @@ fn reviewElisionText(buffer: *ElisionText, count: usize) []const u8 {
 
 /// The rows of a committed edit's full diff, kept so a resumed session shows
 /// the same full diff without the file snapshots it was built from.
-pub const CapturedReview = struct {
+const CapturedReview = struct {
     /// Owned by the caller. Elision rows carry their rendered text. When rows
     /// were left out, the last row is a notice that says how many.
     rows: []types.CommittedFilePresentationLine,
@@ -1138,7 +1138,7 @@ const ReviewCapture = struct {
     }
 };
 
-fn presentationLineKind(op: PreviewOp) types.CommittedFilePresentationLineKind {
+pub fn presentationLineKind(op: PreviewOp) types.CommittedFilePresentationLineKind {
     return switch (op) {
         .context => .context,
         .addition => .addition,

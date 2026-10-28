@@ -1087,8 +1087,23 @@ pub const CommittedFilePresentation = struct {
     /// lines, their bounded context, and elision rows whose text is already
     /// rendered. A presentation with rows carries no file snapshots, so it
     /// costs the size of the change rather than the size of the file. Records
-    /// written before conversation schema 4 carry snapshots or a handle.
+    /// saved before rows existed carry snapshots or a handle instead.
     review_lines: ?[]const CommittedFilePresentationLine = null,
+
+    /// Writes every field as `std.json` would, except `review_lines` when it
+    /// is null, so a presentation without rows encodes as it did before they
+    /// existed and older fx versions, which reject unknown fields, still read it.
+    pub fn jsonStringify(self: CommittedFilePresentation, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(CommittedFilePresentation).@"struct".field_names) |field_name| {
+            const optional = comptime std.mem.eql(u8, field_name, "review_lines");
+            if (!optional or self.review_lines != null) {
+                try writer.objectField(field_name);
+                try writer.write(@field(self, field_name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 /// Rejects competing or wrongly typed durable content authorities. A

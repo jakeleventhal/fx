@@ -133,8 +133,21 @@ const identity_changed_message =
     "file mutation preparation failed: approved filesystem identity changed";
 const preview_too_large_message =
     "file mutation preparation failed: diff preview exceeds preparation limits";
-const total_content_too_large_message =
-    "file mutation preparation failed: content proof exceeds the 32 MiB preparation limit";
+// Limit messages name the limit and the way around it, so the model can
+// still make the change.
+const file_too_large_message = std.fmt.comptimePrint(
+    "file mutation preparation failed: the file is larger than the {d} MiB limit for edit_file and write_file; make the change with a shell command instead",
+    .{max_content_bytes / mib},
+);
+const edited_file_too_large_message = std.fmt.comptimePrint(
+    "edit_file failed: the edit would make the file larger than the {d} MiB limit for edit_file; make the change with a shell command instead",
+    .{max_content_bytes / mib},
+);
+const total_content_too_large_message = std.fmt.comptimePrint(
+    "file mutation preparation failed: the old and new file together are larger than the {d} MiB limit for edit_file and write_file; make the change with a shell command instead",
+    .{max_total_content_bytes / mib},
+);
+const mib = 1024 * 1024;
 
 const FileMutationPrepareError = error{
     OutOfMemory,
@@ -1404,7 +1417,7 @@ fn verifyAndReadPreimage(
         .limited(max_content_bytes + 1),
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.StreamTooLong => return .{ .semantic_failure = "file mutation preparation failed: preimage exceeds the 16 MiB preparation limit" },
+        error.StreamTooLong => return .{ .semantic_failure = file_too_large_message },
         error.ReadFailed => {
             const root = reader.err orelse return error.Unexpected;
             if (operationalError(root)) |operational| return operational;
@@ -1412,7 +1425,7 @@ fn verifyAndReadPreimage(
         },
     };
     if (content.len > max_content_bytes) {
-        return .{ .semantic_failure = "file mutation preparation failed: preimage exceeds the 16 MiB preparation limit" };
+        return .{ .semantic_failure = file_too_large_message };
     }
 
     var content_hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1462,14 +1475,14 @@ fn derivePostimage(
                 usize,
                 prefix_len,
                 edit.new_string.len,
-            ) catch break :blk .{ .semantic_failure = "edit_file failed: postimage exceeds the 16 MiB preparation limit" };
+            ) catch break :blk .{ .semantic_failure = edited_file_too_large_message };
             after_len = std.math.add(
                 usize,
                 after_len,
                 before.len - suffix_start,
-            ) catch break :blk .{ .semantic_failure = "edit_file failed: postimage exceeds the 16 MiB preparation limit" };
+            ) catch break :blk .{ .semantic_failure = edited_file_too_large_message };
             if (after_len > max_content_bytes) {
-                break :blk .{ .semantic_failure = "edit_file failed: postimage exceeds the 16 MiB preparation limit" };
+                break :blk .{ .semantic_failure = edited_file_too_large_message };
             }
 
             const after = try alloc.alloc(u8, after_len);
@@ -2081,7 +2094,7 @@ test "prepare enforces independent preimage and postimage caps" {
     };
     const preimage_policy = try evaluatePolicy(arena, root, preimage_call);
     try std.testing.expectEqualStrings(
-        "file mutation preparation failed: preimage exceeds the 16 MiB preparation limit",
+        file_too_large_message,
         try expectSemanticFailure(arena, preimage_call, preimage_policy),
     );
 
@@ -2096,7 +2109,7 @@ test "prepare enforces independent preimage and postimage caps" {
     };
     const postimage_policy = try evaluatePolicy(arena, root, postimage_call);
     try std.testing.expectEqualStrings(
-        "edit_file failed: postimage exceeds the 16 MiB preparation limit",
+        edited_file_too_large_message,
         try expectSemanticFailure(arena, postimage_call, postimage_policy),
     );
 }

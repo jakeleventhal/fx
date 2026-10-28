@@ -1327,6 +1327,45 @@ pub const ConversationTurnBuilder = struct {
         if (self.results.items.len == self.calls.items.len) try self.finishStep();
     }
 
+    /// Gives the result of `call_id`, already appended in this turn, the
+    /// full-diff rows its edit saved apart from it. Copies `rows`. Returns
+    /// false, keeping nothing, when no such result has a presentation
+    /// without a full-diff source of its own.
+    pub fn attachReviewLines(
+        self: *ConversationTurnBuilder,
+        call_id: []const u8,
+        lifecycle_id: types.ToolLifecycleId,
+        rows: []const types.CommittedFilePresentationLine,
+    ) !bool {
+        const result = self.findResult(call_id) orelse return false;
+        const presentation = if (result.committed_file_presentation) |*value| value else return false;
+        if (presentation.review_lines != null or presentation.lifecycle_id != null or
+            presentation.previous_content != null or presentation.after_content != null or
+            presentation.content_handle != null) return false;
+        const owned_rows = try types.dupeCommittedFilePresentationLines(self.alloc, rows);
+        errdefer types.freeCommittedFilePresentationLines(self.alloc, owned_rows);
+        const owned_call_id = try self.alloc.dupe(u8, lifecycle_id.call_id);
+        presentation.review_lines = owned_rows;
+        presentation.lifecycle_id = .{ .turn_id = lifecycle_id.turn_id, .call_id = owned_call_id };
+        return true;
+    }
+
+    /// The result of `call_id` in the open step or in a step this turn
+    /// already finished.
+    fn findResult(self: *ConversationTurnBuilder, call_id: []const u8) ?*types.PersistedToolResult {
+        for (self.results.items) |*result| {
+            if (std.mem.eql(u8, result.tool_call_id, call_id)) return result;
+        }
+        var index = self.steps.items.len;
+        while (index > 0) {
+            index -= 1;
+            for (self.steps.items[index].tool_results) |*result| {
+                if (std.mem.eql(u8, result.tool_call_id, call_id)) return result;
+            }
+        }
+        return null;
+    }
+
     pub fn finishStandalone(self: *ConversationTurnBuilder) !void {
         if (self.calls.items.len != 0 or self.results.items.len != 0) return error.InvalidConversationFrame;
         const text = self.pending_assistant orelse return;
@@ -1499,6 +1538,53 @@ test "conversation replay keeps reasoning-only assistant units before the final 
     try std.testing.expectEqualStrings("answer", turn.assistant.assistant);
     try std.testing.expectEqual(@as(usize, 1), turn.assistant.execution.tool_steps.len);
     try std.testing.expectEqualStrings(replay.parts_json, turn.assistant.execution.tool_steps[0].provider_replay.?.parts_json);
+}
+
+test "review rows attach once, only to a turn's edit with no full-diff source" {
+    const alloc = std.testing.allocator;
+    var builder = ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    const preview = [_]types.CommittedFilePresentationLine{.{ .kind = .addition, .new_line = 1, .text = "new" }};
+    const rows = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .addition, .new_line = 1, .text = "new" },
+        .{ .kind = .context, .old_line = 1, .new_line = 2, .text = "tail" },
+    };
+    try builder.begin(.{ .text = "edit" });
+    try builder.appendToolCall(.{ .call_id = "edit-1", .tool_name = "edit_file", .arguments_json = "{}" });
+    try builder.appendToolCall(.{ .call_id = "write-1", .tool_name = "write_file", .arguments_json = "{}" });
+    try builder.appendToolResult(.{
+        .call_id = "edit-1",
+        .tool_name = "edit_file",
+        .status = .success,
+        .artifact_ref = "result.txt",
+        .stored_bytes = 0,
+        .completeness = .complete,
+        .committed_file_presentation = .{ .path = "a.txt", .kind = .edited, .lines = &preview, .additions = 1, .deletions = 0, .truncated = false },
+    });
+    // The second result finishes the step; attaching still finds both.
+    try builder.appendToolResult(.{
+        .call_id = "write-1",
+        .tool_name = "write_file",
+        .status = .success,
+        .artifact_ref = "result.txt",
+        .stored_bytes = 0,
+        .completeness = .complete,
+        .committed_file_presentation = .{ .path = "b.txt", .kind = .added, .lines = &preview, .additions = 1, .deletions = 0, .truncated = false, .previous_content = "", .after_content = "new\n" },
+    });
+    const edit_id: types.ToolLifecycleId = .{ .turn_id = 1, .call_id = "edit-1" };
+    try std.testing.expect(!try builder.attachReviewLines("missing", edit_id, &rows));
+    try std.testing.expect(!try builder.attachReviewLines("write-1", .{ .turn_id = 1, .call_id = "write-1" }, &rows));
+    try std.testing.expect(try builder.attachReviewLines("edit-1", edit_id, &rows));
+    try std.testing.expect(!try builder.attachReviewLines("edit-1", edit_id, &rows));
+    try builder.appendAssistant(.{ .text = "done" });
+    const turn = try builder.finishAssistant(.{});
+    defer types.freeHistoryTurn(alloc, turn);
+    const results = turn.assistant.execution.tool_steps[0].tool_results;
+    const edit = results[0].committed_file_presentation.?;
+    try std.testing.expectEqual(rows.len, edit.review_lines.?.len);
+    try std.testing.expectEqualStrings("tail", edit.review_lines.?[1].text);
+    try std.testing.expectEqualStrings("edit-1", edit.lifecycle_id.?.call_id);
+    try std.testing.expect(results[1].committed_file_presentation.?.review_lines == null);
 }
 
 test "reasoning-only checkpoint coverage and replay count the same completed unit" {

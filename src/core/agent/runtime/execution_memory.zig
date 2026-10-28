@@ -1167,13 +1167,7 @@ pub fn captureCommittedFilePresentation(
     }
     for (handoff.preview.lines, 0..) |line, index| {
         lines[index] = .{
-            .kind = switch (line.op) {
-                .context => .context,
-                .addition => .addition,
-                .deletion => .deletion,
-                .elision => .elision,
-                .notice => .notice,
-            },
+            .kind = diff_mod.presentationLineKind(line.op),
             .old_line = line.old_line,
             .new_line = line.new_line,
             .text = try alloc.dupe(u8, line.text),
