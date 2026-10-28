@@ -583,7 +583,7 @@ def build_external_o2_control(
         require_empty_stderr=True,
     )
     run_checked(
-        (str(toolchain.strip), "-S", "-x", str(binary)),
+        (str(toolchain.tools.strip), "-S", "-x", str(binary)),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=120,

@@ -21,6 +21,7 @@ from scripts.pgso.qualify import (
     EvidenceRecorder,
     _read_hyperfine_samples,
     build_benchmark_pair,
+    build_external_o2_control,
     build_profile_linked_benchmarks,
     compare_samples,
     measure_alternating,
@@ -672,6 +673,41 @@ class PgsoQualificationTests(unittest.TestCase):
                 workload_names=("ui-activity",),
                 prebuilt_pairs={"ui_activity": pair},
             )
+
+    def test_external_control_is_optimized_linked_and_stripped_with_platform_tools(self) -> None:
+        tools = self.root / "tools"
+        tools.mkdir()
+        actions = self.root / "actions.log"
+
+        def fake(name: str) -> pathlib.Path:
+            path = tools / name
+            path.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib, sys\n"
+                f"with open({str(actions)!r}, 'a') as stream:\n"
+                f"    stream.write({name!r} + ' ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+                "if '-o' in sys.argv:\n"
+                "    pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')\n",
+                encoding="utf-8",
+            )
+            path.chmod(0o755)
+            return path
+
+        toolchain = types.SimpleNamespace(
+            opt=fake("opt"),
+            llc=fake("llc"),
+            zig=fake("zig"),
+            target="aarch64-macos",
+            tools=types.SimpleNamespace(strip=fake("strip")),
+        )
+        paths = PipelinePaths.create(self.root / "run", selector="ui_activity")
+
+        binary = build_external_o2_control(toolchain, paths)
+
+        self.assertEqual(paths.root / "external-control" / paths.binary_name, binary)
+        lines = actions.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(["opt", "llc", "zig", "strip"], [line.split()[0] for line in lines])
+        self.assertEqual(f"strip -S -x {binary}", lines[3])
 
     def test_benchmark_pair_uses_the_external_control_for_minimum_macos(self) -> None:
         plan = BENCHMARK_PLANS[0]
