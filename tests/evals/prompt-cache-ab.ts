@@ -204,14 +204,16 @@ export const SCENARIOS: Scenario[] = [
   { name: "control", turns: ["Reply with the single word OK."] },
   {
     // The agent switches branches mid-turn; later turns ask which branch is
-    // checked out, and before the last one it switches back outside fx.
+    // checked out, and before the last one it switches back outside fx. The
+    // switch back names `master`, so it works even when a build never ran the
+    // first turn's checkout.
     name: "branchnote",
     turns: [
       "Use the shell tool to run `git checkout -q -b feature-x`, then reply with only the word done.",
       "Without running any tools, which git branch is checked out right now? Reply with only the branch name.",
       "Without running any tools, which git branch is checked out right now? Reply with only the branch name.",
     ],
-    beforeTurn: { 2: (repo) => git(repo, "checkout", "-q", "-") },
+    beforeTurn: { 2: (repo) => git(repo, "checkout", "-q", "master") },
     check: (run) => {
       const texts = run.turns.slice(1).map((t) => t.output.toLowerCase());
       return texts.length >= 3 && texts[0].includes("done") && texts[1].includes("feature-x") && texts[2].includes("master");
