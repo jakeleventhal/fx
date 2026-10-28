@@ -6368,10 +6368,15 @@ test "durable session optional fields handle fuzzed ownership paths" {
 }
 
 test "per-turn work provenance parser handles fuzzed ownership paths" {
+    // The fourth to sixth seeds hold context notes (schema 11, D93) and a
+    // saved runtime context (schema 12, D94).
     try std.testing.fuzz({}, fuzzWorkProvenanceHistoryTurn, .{ .corpus = &(@import("fuzz_seed").slices(.{
         "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[],\"work_id\":\"work-1\"},\"assistant\":\"reply\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}}",
         "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"reply\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}}",
         "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[],\"work_id\":\"\"}}",
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"reply\",\"execution\":{\"schema_version\":11,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[{\"text\":\"<scoped-rules from=\\\"sub/AGENTS.md\\\" scope=\\\"sub\\\">\\nR\\n</scoped-rules>\",\"after_tool_step_count\":0,\"sources\":[{\"path\":\"/w/sub/AGENTS.md\",\"stamp\":7}]}],\"turn_summary\":null}}",
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"reply\",\"execution\":{\"schema_version\":12,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[{\"text\":\"<fx-skill-used>\\nnote\\n</fx-skill-used>\",\"after_tool_step_count\":0}],\"runtime_context\":[\"<fx-turn-context>\\ngit_branch: main\\n</fx-turn-context>\",\"Runtime context: permission mode is auto.\"],\"turn_summary\":null}}",
+        "{\"kind\":\"interrupted\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"execution\":{\"schema_version\":12,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[{\"text\":\"n\",\"after_tool_step_count\":1,\"sources\":[{\"path\":\"\",\"stamp\":0}]}],\"runtime_context\":[],\"turn_summary\":null}}",
         "",
         "{}",
     }) ++ @import("fuzz_corpus").session_work_provenance.*) });

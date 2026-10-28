@@ -4857,6 +4857,32 @@ fn decodePiece(arena: Allocator, kind: PieceKind, data: []const u8, allocate: st
     return event;
 }
 
+test "v2 conversation pieces stay bounded under fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzConversationPiece, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "{}",
+            "{\"text\":\"ok\"}",
+            // A context note (D93) and a saved runtime context (D94), as v2 writes them.
+            "{\"text\":\"<scoped-rules from=\\\"sub/AGENTS.md\\\" scope=\\\"sub\\\">\\nR\\n</scoped-rules>\",\"sources\":[{\"path\":\"/w/sub/AGENTS.md\",\"stamp\":7}]}",
+            "{\"text\":\"n\",\"sources\":[{\"path\":\"\",\"stamp\":0}]}",
+            "{\"messages\":[\"<fx-turn-context>\\ngit_branch: main\\n</fx-turn-context>\",\"Runtime context: permission mode is auto.\"]}",
+            "{\"messages\":[]}",
+        }) ++ @import("fuzz_corpus").session_conversation_piece.*),
+    });
+}
+
+/// Reads the bytes as a piece of every kind, as replay does for a v2 item.
+fn fuzzConversationPiece(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [4096]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    inline for (@typeInfo(PieceKind).@"enum".field_names) |name| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        _ = decodePiece(arena_state.allocator(), @field(PieceKind, name), buffer[0..len], .alloc_always) catch {};
+    }
+}
+
 /// A user piece as v2 writes it: `session_event.ConversationUser` field for
 /// field, so a prompt without inline images encodes as v1's does. An
 /// image's inline bytes, which a v2 session keeps inside the turn (D44),
