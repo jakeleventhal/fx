@@ -1084,13 +1084,40 @@ pub const CommittedFilePresentation = struct {
     /// In-memory live-turn presentations keep contents inline and leave this
     /// null; only the persistence projection sets it.
     content_handle: ?[]const u8 = null,
+    /// The rows of the full diff, captured when the edit commits: changed
+    /// lines, their bounded context, and elision rows whose text is already
+    /// rendered. A presentation with rows carries no file snapshots, so it
+    /// costs the size of the change rather than the size of the file. Records
+    /// saved before rows existed carry snapshots or a handle instead.
+    review_lines: ?[]const CommittedFilePresentationLine = null,
+
+    /// Writes every field as `std.json` would, except `review_lines` when it
+    /// is null, so a presentation without rows encodes as it did before they
+    /// existed and older fx versions, which reject unknown fields, still read it.
+    pub fn jsonStringify(self: CommittedFilePresentation, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(CommittedFilePresentation).@"struct".field_names) |field_name| {
+            const optional = comptime std.mem.eql(u8, field_name, "review_lines");
+            if (!optional or self.review_lines != null) {
+                try writer.objectField(field_name);
+                try writer.write(@field(self, field_name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 /// Rejects competing or wrongly typed durable content authorities. A
-/// preview-only presentation may have neither inline snapshots nor a handle.
+/// preview-only presentation may have no review rows, inline snapshots, or
+/// handle; otherwise exactly one of them supplies the full diff.
 pub fn committedFilePresentationContentSourceValid(
     presentation: CommittedFilePresentation,
 ) bool {
+    if (presentation.review_lines != null) {
+        return presentation.previous_content == null and
+            presentation.after_content == null and
+            presentation.content_handle == null;
+    }
     const handle = presentation.content_handle orelse return true;
     return presentation.previous_content == null and
         presentation.after_content == null and
@@ -2854,20 +2881,20 @@ pub fn freePersistedToolResults(alloc: std.mem.Allocator, results: []PersistedTo
     if (results.len > 0) alloc.free(results);
 }
 
-pub fn dupeCommittedFilePresentation(
+/// Copies `lines` and every line's text. Caller owns the result; release it
+/// with `freeCommittedFilePresentationLines`.
+pub fn dupeCommittedFilePresentationLines(
     alloc: std.mem.Allocator,
-    presentation: CommittedFilePresentation,
-) !CommittedFilePresentation {
-    const path = try alloc.dupe(u8, presentation.path);
-    errdefer alloc.free(path);
-    const lines = try alloc.alloc(CommittedFilePresentationLine, presentation.lines.len);
-    errdefer alloc.free(lines);
+    lines: []const CommittedFilePresentationLine,
+) ![]CommittedFilePresentationLine {
+    const copy = try alloc.alloc(CommittedFilePresentationLine, lines.len);
+    errdefer alloc.free(copy);
     var copied_lines: usize = 0;
     errdefer {
-        for (lines[0..copied_lines]) |line| alloc.free(@constCast(line.text));
+        for (copy[0..copied_lines]) |line| alloc.free(@constCast(line.text));
     }
-    for (presentation.lines, 0..) |line, index| {
-        lines[index] = .{
+    for (lines, 0..) |line, index| {
+        copy[index] = .{
             .kind = line.kind,
             .old_line = line.old_line,
             .new_line = line.new_line,
@@ -2875,6 +2902,25 @@ pub fn dupeCommittedFilePresentation(
         };
         copied_lines += 1;
     }
+    return copy;
+}
+
+pub fn freeCommittedFilePresentationLines(
+    alloc: std.mem.Allocator,
+    lines: []const CommittedFilePresentationLine,
+) void {
+    for (lines) |line| alloc.free(@constCast(line.text));
+    if (lines.len > 0) alloc.free(@constCast(lines));
+}
+
+pub fn dupeCommittedFilePresentation(
+    alloc: std.mem.Allocator,
+    presentation: CommittedFilePresentation,
+) !CommittedFilePresentation {
+    const path = try alloc.dupe(u8, presentation.path);
+    errdefer alloc.free(path);
+    const lines = try dupeCommittedFilePresentationLines(alloc, presentation.lines);
+    errdefer freeCommittedFilePresentationLines(alloc, lines);
     const previous_content = if (presentation.previous_content) |content|
         try alloc.dupe(u8, content)
     else
@@ -2895,6 +2941,10 @@ pub fn dupeCommittedFilePresentation(
     else
         null;
     errdefer if (content_handle) |handle| alloc.free(handle);
+    const review_lines = if (presentation.review_lines) |rows|
+        try dupeCommittedFilePresentationLines(alloc, rows)
+    else
+        null;
     return .{
         .path = path,
         .kind = presentation.kind,
@@ -2906,6 +2956,7 @@ pub fn dupeCommittedFilePresentation(
         .after_content = after_content,
         .lifecycle_id = lifecycle_id,
         .content_handle = content_handle,
+        .review_lines = review_lines,
     };
 }
 
@@ -2914,12 +2965,12 @@ pub fn freeCommittedFilePresentation(
     presentation: CommittedFilePresentation,
 ) void {
     alloc.free(@constCast(presentation.path));
-    for (presentation.lines) |line| alloc.free(@constCast(line.text));
-    if (presentation.lines.len > 0) alloc.free(@constCast(presentation.lines));
+    freeCommittedFilePresentationLines(alloc, presentation.lines);
     if (presentation.previous_content) |content| alloc.free(@constCast(content));
     if (presentation.after_content) |content| alloc.free(@constCast(content));
     if (presentation.lifecycle_id) |id| alloc.free(@constCast(id.call_id));
     if (presentation.content_handle) |handle| alloc.free(@constCast(handle));
+    if (presentation.review_lines) |rows| freeCommittedFilePresentationLines(alloc, rows);
 }
 
 fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult) !PersistedToolResult {

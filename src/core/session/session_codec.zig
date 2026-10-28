@@ -2253,21 +2253,10 @@ fn writeExecutionFilePresentation(
     try writeExecutionBytes(writer, presentation.path, format);
     try writer.writeAll(",\"kind\":");
     try writeJsonString(writer, @tagName(presentation.kind));
-    try writer.writeAll(",\"lines\":[");
-    for (presentation.lines, 0..) |line, i| {
-        if (i > 0) try writer.writeByte(',');
-        try writer.writeAll("{\"kind\":");
-        try writeJsonString(writer, @tagName(line.kind));
-        try writer.writeAll(",\"old_line\":");
-        try writeOptionalU32(writer, line.old_line);
-        try writer.writeAll(",\"new_line\":");
-        try writeOptionalU32(writer, line.new_line);
-        try writer.writeAll(",\"text\":");
-        try writeExecutionBytes(writer, line.text, format);
-        try writer.writeByte('}');
-    }
+    try writer.writeAll(",\"lines\":");
+    try writeExecutionFilePresentationLines(writer, presentation.lines, format);
     try writer.print(
-        "],\"additions\":{d},\"deletions\":{d},\"truncated\":{s},\"previous_content\":",
+        ",\"additions\":{d},\"deletions\":{d},\"truncated\":{s},\"previous_content\":",
         .{
             presentation.additions,
             presentation.deletions,
@@ -2293,7 +2282,34 @@ fn writeExecutionFilePresentation(
     } else if (format == .presentation) {
         try writer.writeAll(",\"content_handle\":null");
     }
+    // Only presentations captured as review rows carry the key, so records
+    // without rows keep their shipped shape in both formats.
+    if (presentation.review_lines) |rows| {
+        try writer.writeAll(",\"review_lines\":");
+        try writeExecutionFilePresentationLines(writer, rows, format);
+    }
     try writer.writeByte('}');
+}
+
+fn writeExecutionFilePresentationLines(
+    writer: *std.Io.Writer,
+    lines: []const types.CommittedFilePresentationLine,
+    format: ExecutionMemoryJsonFormat,
+) !void {
+    try writer.writeByte('[');
+    for (lines, 0..) |line, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"kind\":");
+        try writeJsonString(writer, @tagName(line.kind));
+        try writer.writeAll(",\"old_line\":");
+        try writeOptionalU32(writer, line.old_line);
+        try writer.writeAll(",\"new_line\":");
+        try writeOptionalU32(writer, line.new_line);
+        try writer.writeAll(",\"text\":");
+        try writeExecutionBytes(writer, line.text, format);
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
 }
 
 fn writeExecutionFileEvidence(
@@ -3416,12 +3432,12 @@ fn parseCommittedFilePresentation(
         "after_content",
         "lifecycle_id",
     };
-    const presentation_extended_keys = presentation_legacy_keys ++ [_][]const u8{"content_handle"};
-    const object = (try exactVariantObject(
+    // A handle came with externalized snapshots, and rows came after them.
+    const object = try exactObjectWithOptionalKeys(
         value,
         &presentation_legacy_keys,
-        &presentation_extended_keys,
-    )).object;
+        &.{ "content_handle", "review_lines" },
+    );
     const path = try parseRequiredDurableBytes(alloc, object, "path");
     errdefer mem_utils.free(alloc, path);
     const lines = try parseCommittedFilePresentationLines(
@@ -3450,6 +3466,11 @@ fn parseCommittedFilePresentation(
     else
         null;
     errdefer if (content_handle) |handle| mem_utils.free(alloc, handle);
+    const review_lines = if (object.get("review_lines")) |rows_value| switch (rows_value) {
+        .null => null,
+        else => try parseCommittedFilePresentationLines(alloc, rows_value),
+    } else null;
+    errdefer if (review_lines) |rows| freeCommittedFilePresentationLines(alloc, rows);
     const presentation = types.CommittedFilePresentation{
         .path = path,
         .kind = std.meta.stringToEnum(
@@ -3464,6 +3485,7 @@ fn parseCommittedFilePresentation(
         .after_content = after_content,
         .lifecycle_id = lifecycle_id,
         .content_handle = content_handle,
+        .review_lines = review_lines,
     };
     if (!types.committedFilePresentationContentSourceValid(presentation)) {
         return error.InvalidSessionFormat;
@@ -3776,6 +3798,30 @@ fn expectToken(actual: std.json.Token, comptime expected: std.meta.Tag(std.json.
 noinline fn requireObject(value: std.json.Value) !std.json.ObjectMap {
     if (value != .object) return error.InvalidSessionFormat;
     return value.object;
+}
+
+/// Accepts an object that has every `required` key, any subset of the
+/// `optional` keys, and no other key.
+fn exactObjectWithOptionalKeys(
+    value: std.json.Value,
+    required: []const []const u8,
+    optional: []const []const u8,
+) !std.json.ObjectMap {
+    const object = try requireObject(value);
+    for (required) |key| {
+        if (!object.contains(key)) return error.InvalidSessionFormat;
+    }
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const known = for (required) |candidate| {
+            if (std.mem.eql(u8, key, candidate)) break true;
+        } else for (optional) |candidate| {
+            if (std.mem.eql(u8, key, candidate)) break true;
+        } else false;
+        if (!known) return error.InvalidSessionFormat;
+    }
+    return object;
 }
 
 pub fn exactObject(value: std.json.Value, keys: []const []const u8) !std.json.ObjectMap {
@@ -4793,6 +4839,79 @@ test "committed file presentation codec reads shipped and spilled shapes" {
         "diff-0123456789abcdef-0123456789abcdef.json",
         spilled_roundtrip.content_handle.?,
     );
+}
+
+test "committed file presentation codec round trips captured review rows" {
+    const alloc = std.testing.allocator;
+    const preview = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .deletion, .old_line = 4, .text = "old" },
+        .{ .kind = .addition, .new_line = 4, .text = "new" },
+    };
+    const rows = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .elision, .text = "3 unchanged lines ⋯" },
+        .{ .kind = .deletion, .old_line = 4, .text = "old" },
+        .{ .kind = .addition, .new_line = 4, .text = "new" },
+        .{ .kind = .context, .old_line = 5, .new_line = 5, .text = "tail" },
+    };
+    const captured: types.CommittedFilePresentation = .{
+        .path = "lock.yaml",
+        .kind = .edited,
+        .lines = &preview,
+        .additions = 1,
+        .deletions = 1,
+        .truncated = false,
+        .lifecycle_id = .{ .turn_id = 4, .call_id = "call_edit" },
+        .review_lines = &rows,
+    };
+
+    for ([_]ExecutionMemoryJsonFormat{ .durable, .presentation }) |format| {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try writeExecutionFilePresentation(&out.writer, captured, format);
+        try std.testing.expect(std.mem.find(u8, out.written(), "\"review_lines\":[") != null);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+        defer parsed.deinit();
+        const decoded = try parseCommittedFilePresentation(alloc, parsed.value);
+        defer types.freeCommittedFilePresentation(alloc, decoded);
+
+        try std.testing.expect(decoded.previous_content == null);
+        try std.testing.expect(decoded.after_content == null);
+        try std.testing.expect(decoded.content_handle == null);
+        try std.testing.expectEqualStrings("call_edit", decoded.lifecycle_id.?.call_id);
+        const decoded_rows = decoded.review_lines.?;
+        try std.testing.expectEqual(rows.len, decoded_rows.len);
+        for (rows, decoded_rows) |expected, actual| {
+            try std.testing.expectEqual(expected.kind, actual.kind);
+            try std.testing.expectEqual(expected.old_line, actual.old_line);
+            try std.testing.expectEqual(expected.new_line, actual.new_line);
+            try std.testing.expectEqualStrings(expected.text, actual.text);
+        }
+    }
+
+    // Rows are the only content source they can appear with, and each row
+    // has a known kind.
+    const head = "{\"path\":\"lock.yaml\",\"kind\":\"edited\",\"lines\":[],\"additions\":1,\"deletions\":1,\"truncated\":false,";
+    const rejected = [_][]const u8{
+        head ++ "\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"content_handle\":\"diff-0123456789abcdef-0123456789abcdef.json\",\"review_lines\":[]}",
+        head ++ "\"previous_content\":\"old\",\"after_content\":\"new\",\"lifecycle_id\":null,\"review_lines\":[]}",
+        head ++ "\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"review_lines\":[{\"kind\":\"moved\",\"old_line\":null,\"new_line\":null,\"text\":\"x\"}]}",
+    };
+    for (rejected) |bytes| {
+        var competing_parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+        defer competing_parsed.deinit();
+        try std.testing.expectError(
+            error.InvalidSessionFormat,
+            parseCommittedFilePresentation(alloc, competing_parsed.value),
+        );
+    }
+
+    // A presentation without rows keeps the shipped shape.
+    var without_rows = captured;
+    without_rows.review_lines = null;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeExecutionFilePresentation(&out.writer, without_rows, .durable);
+    try std.testing.expect(std.mem.find(u8, out.written(), "review_lines") == null);
 }
 
 fn checkV7SteeringAllocationFailures(alloc: Allocator) !void {

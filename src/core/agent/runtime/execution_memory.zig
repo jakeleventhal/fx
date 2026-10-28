@@ -9,6 +9,7 @@ const session_child_store = @import("../../session/session_child_store.zig");
 const command_output_content = @import("../../tooling/command_output_content.zig");
 const io_mod = @import("../../shared/io.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
+const diff_mod = @import("../../output/diff.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tool_result_limits = @import("../../tooling/tool_result_limits.zig");
 const text_utils = @import("../../shared/text_utils.zig");
@@ -1109,6 +1110,49 @@ fn retainCommandReplay(
     memory.command_output_replay = candidate.retain(arena);
 }
 
+/// Text budget for the full-diff rows a committed file presentation keeps for
+/// a resumed session. Every history copy, recovery checkpoint, and saved turn
+/// carries these rows, and they grow with the change, not the file. The
+/// budget only bounds diffs as large as a whole rewritten file: 4 MiB keeps
+/// every row of any write the former 4 MiB file limit allowed.
+const max_captured_review_bytes: usize = 4 * 1024 * 1024;
+
+/// The full-diff rows a resumed session shows for `handoff`, or null when
+/// the handoff has no full view or the review cannot be indexed. Caller owns
+/// the rows.
+fn captureReviewLines(
+    alloc: Allocator,
+    handoff: file_mutation.CommittedFileHandoff,
+) Allocator.Error!?[]types.CommittedFilePresentationLine {
+    const full_view = handoff.full_view orelse return null;
+    const captured = diff_mod.captureReviewLines(
+        alloc,
+        handoff.tracker.previous_content,
+        full_view.after_content,
+        max_captured_review_bytes,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ArithmeticOverflow => {
+            debug_trace.logf(
+                "session",
+                "committed file review rows unavailable call_id={s} err={s}; resumed view keeps the preview",
+                .{ full_view.lifecycle_id.call_id, @errorName(err) },
+            );
+            return null;
+        },
+    };
+    if (captured.omitted_rows > 0) {
+        debug_trace.logf(
+            "session",
+            "committed file review rows truncated call_id={s} kept_rows={d} omitted_rows={d} budget_bytes={d}",
+            .{ full_view.lifecycle_id.call_id, captured.rows.len - 1, captured.omitted_rows, max_captured_review_bytes },
+        );
+    }
+    return captured.rows;
+}
+
+/// Projects a committed file change for history and resume. The full diff is
+/// kept as its rendered rows, never as the file snapshots behind them.
 pub fn captureCommittedFilePresentation(
     alloc: Allocator,
     handoff: file_mutation.CommittedFileHandoff,
@@ -1123,33 +1167,19 @@ pub fn captureCommittedFilePresentation(
     }
     for (handoff.preview.lines, 0..) |line, index| {
         lines[index] = .{
-            .kind = switch (line.op) {
-                .context => .context,
-                .addition => .addition,
-                .deletion => .deletion,
-                .elision => .elision,
-                .notice => .notice,
-            },
+            .kind = diff_mod.presentationLineKind(line.op),
             .old_line = line.old_line,
             .new_line = line.new_line,
             .text = try alloc.dupe(u8, line.text),
         };
         copied_lines += 1;
     }
-    const full_view = handoff.full_view;
-    const previous_content = if (full_view != null) if (handoff.tracker.previous_content) |content|
-        try alloc.dupe(u8, content)
-    else
-        null else null;
-    errdefer if (previous_content) |content| alloc.free(content);
-    const after_content = if (full_view) |full|
-        try alloc.dupe(u8, full.after_content)
-    else
-        null;
-    errdefer if (after_content) |content| alloc.free(content);
-    const lifecycle_id: ?types.ToolLifecycleId = if (full_view) |full| .{
-        .turn_id = full.lifecycle_id.turn_id,
-        .call_id = try alloc.dupe(u8, full.lifecycle_id.call_id),
+    const review_lines = try captureReviewLines(alloc, handoff);
+    errdefer if (review_lines) |rows| types.freeCommittedFilePresentationLines(alloc, rows);
+    // The lifecycle id names the full diff, so it exists only with the rows.
+    const lifecycle_id: ?types.ToolLifecycleId = if (review_lines != null) .{
+        .turn_id = handoff.full_view.?.lifecycle_id.turn_id,
+        .call_id = try alloc.dupe(u8, handoff.full_view.?.lifecycle_id.call_id),
     } else null;
     errdefer if (lifecycle_id) |id| alloc.free(@constCast(id.call_id));
     return .{
@@ -1162,10 +1192,100 @@ pub fn captureCommittedFilePresentation(
         .additions = handoff.preview.additions,
         .deletions = handoff.preview.deletions,
         .truncated = handoff.preview.truncated,
-        .previous_content = previous_content,
-        .after_content = after_content,
         .lifecycle_id = lifecycle_id,
+        .review_lines = review_lines,
     };
+}
+
+fn testCommittedEditHandoff(
+    previous_content: []const u8,
+    after_content: []const u8,
+) file_mutation.CommittedFileHandoff {
+    return .{
+        .preview = .{
+            .path = "pnpm-lock.yaml",
+            .lines = &.{
+                .{ .op = .deletion, .old_line = 1, .text = "before" },
+                .{ .op = .addition, .new_line = 1, .text = "after" },
+            },
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+        },
+        .tracker = .{
+            .kind = .edit,
+            .raw_path = "pnpm-lock.yaml",
+            .previous_content = previous_content,
+            .committed_at_ms = 1,
+        },
+        .full_view = .{
+            .after_content = after_content,
+            .lifecycle_id = .{ .turn_id = 7, .call_id = "edit_1" },
+        },
+    };
+}
+
+fn testLockfile(alloc: Allocator, line_count: usize, changed: ?usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (0..line_count) |index| {
+        if (changed == index) {
+            try out.print(alloc, "  resolution: {{integrity: sha512-{d}}}\n", .{index});
+        } else {
+            try out.print(alloc, "  resolution: {{tarball: https://example.com/{d}.tgz}}\n", .{index});
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+test "committed file presentation keeps the full diff as rows, never file snapshots" {
+    const alloc = std.testing.allocator;
+    const previous = try testLockfile(alloc, 50_000, null);
+    defer alloc.free(previous);
+    const after = try testLockfile(alloc, 50_000, 25_000);
+    defer alloc.free(after);
+
+    const presentation = try captureCommittedFilePresentation(
+        alloc,
+        testCommittedEditHandoff(previous, after),
+    );
+    defer types.freeCommittedFilePresentation(alloc, presentation);
+
+    try std.testing.expect(presentation.previous_content == null);
+    try std.testing.expect(presentation.after_content == null);
+    try std.testing.expect(presentation.content_handle == null);
+    try std.testing.expect(types.committedFilePresentationContentSourceValid(presentation));
+    try std.testing.expectEqual(@as(u64, 7), presentation.lifecycle_id.?.turn_id);
+    try std.testing.expectEqualStrings("edit_1", presentation.lifecycle_id.?.call_id);
+
+    // One changed line keeps an elision, five context lines on each side, the
+    // replacement pair, and a closing elision, whatever the file's size.
+    const rows = presentation.review_lines.?;
+    try std.testing.expectEqual(@as(usize, 14), rows.len);
+    var row_bytes: usize = 0;
+    for (rows) |row| row_bytes += row.text.len;
+    try std.testing.expect(row_bytes < 1024);
+    try std.testing.expectEqualStrings("24995 unchanged lines ⋯", rows[0].text);
+    try std.testing.expectEqual(types.CommittedFilePresentationLineKind.deletion, rows[6].kind);
+    try std.testing.expectEqual(@as(?u32, 25_001), rows[6].old_line);
+    try std.testing.expectEqualStrings("  resolution: {integrity: sha512-25000}", rows[7].text);
+    try std.testing.expectEqualStrings("24994 unchanged lines ⋯", rows[13].text);
+}
+
+test "committed file presentation without a full view keeps only its preview" {
+    const alloc = std.testing.allocator;
+    var handoff = testCommittedEditHandoff("before\n", "after\n");
+    handoff.full_view = null;
+
+    const presentation = try captureCommittedFilePresentation(alloc, handoff);
+    defer types.freeCommittedFilePresentation(alloc, presentation);
+
+    try std.testing.expect(presentation.review_lines == null);
+    try std.testing.expect(presentation.lifecycle_id == null);
+    try std.testing.expectEqual(types.CommittedFilePresentationKind.edited, presentation.kind);
+    try std.testing.expectEqual(@as(usize, 2), presentation.lines.len);
+    try std.testing.expectEqualStrings("before", presentation.lines[0].text);
+    try std.testing.expect(types.committedFilePresentationContentSourceValid(presentation));
 }
 
 fn toolCall(id: []const u8, name: []const u8, args: []const u8) ToolCall {
