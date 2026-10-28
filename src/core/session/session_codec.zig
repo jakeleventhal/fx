@@ -596,6 +596,23 @@ pub fn namesImages(user: session.UserTurn, stored: ?*const StoredImages) bool {
     return false;
 }
 
+/// Whether `execution` is written as schema 11 or 12, with context notes
+/// (D93) or a saved runtime context (D94), which an fx from before them
+/// rejects. A journal event, checkpoint, or snapshot that holds one says so
+/// in its own version, so an older reader reports a newer format instead of
+/// a corrupt one. Matches the choice in `writeExecutionMemoryJsonFrom`.
+pub fn executionUsesNotesSchema(execution: session.ExecutionMemory) bool {
+    return execution.runtime_context != null or execution.context_notes.len > 0;
+}
+
+pub fn turnUsesNotesSchema(turn: session.HistoryTurn) bool {
+    return switch (turn) {
+        .assistant => |entry| executionUsesNotesSchema(entry.execution),
+        .interrupted => |entry| executionUsesNotesSchema(entry.execution),
+        .compacted_summary => false,
+    };
+}
+
 pub fn turnNamesImages(turn: session.HistoryTurn, stored: ?*const StoredImages) bool {
     return switch (turn) {
         .assistant => |entry| namesImages(entry.user, stored) or executionNamesImages(entry.execution, .{}, stored),

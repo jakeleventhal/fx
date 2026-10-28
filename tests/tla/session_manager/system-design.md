@@ -1634,7 +1634,10 @@ rewriting a cached prompt prefix):
     `session_codec.zig` names notes only in schema version 11, written only
     for a turn that has notes; a turn without them keeps version 10 and its
     bytes. An older fx rejects version 11, as it rejects every newer
-    version.
+    version. A libfx journal event, kernel checkpoint, or snapshot that
+    holds such a turn is written as version 4, so an older libfx reports a
+    newer journal format, `FxJournalVersionError`, instead of an invalid
+    journal; one without notes keeps its earlier version.
   - **Compaction:** notes in turns a summary covers go with them. In the
     first kept turn, the notes before the cut's step boundary go, and so do
     the notes at that boundary when the cut also covers steering there,
@@ -1672,7 +1675,8 @@ permission mode does not rewrite a cached prompt prefix):
     `runtime_context` item comes right after its user message, and every
     save of the turn carries it, so a streamed turn keeps the same prefix.
     In the execution JSON it needs schema version 12, written only for that
-    turn.
+    turn, and libfx versions the journal, checkpoint, and snapshot that hold
+    it as D93 does.
   - **Changes:** before each request fx compares the host's current runtime
     context with what the model last saw: the newest update note in the
     retained turns, or else the saved copy. When they differ, an update
