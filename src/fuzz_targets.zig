@@ -13,6 +13,7 @@ test {
     _ = @import("core/images/image_route.zig");
     _ = @import("core/mcp/elicitation.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
+    _ = @import("core/session/session_adapter.zig");
     _ = @import("core/session/session_codec.zig");
     _ = @import("core/session/session_event.zig");
     _ = @import("core/shared/display_width.zig");

@@ -1425,7 +1425,7 @@ const App = struct {
             0,
             false,
         );
-        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        errdefer self.releaseUnadmittedPrompt(queued);
         try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
         return true;
@@ -1448,10 +1448,17 @@ const App = struct {
             turn_id,
             user_prompt_already_presented,
         );
-        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        errdefer self.releaseUnadmittedPrompt(queued);
         try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
         return true;
+    }
+
+    /// Frees a prompt the worker refused, giving back the stale shell handles
+    /// note it took so the next prompt carries it.
+    fn releaseUnadmittedPrompt(self: *App, queued: worker_runtime.QueuedPrompt) void {
+        if (queued.stale_shell_handles) self.session.returnStaleShellHandles(queued.turn_id);
+        worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
     }
 
     // Caller owns the returned prompt until worker admission succeeds.
@@ -1568,6 +1575,7 @@ const App = struct {
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
             .user_prompt_already_presented = user_prompt_already_presented,
+            .stale_shell_handles = self.session.takeStaleShellHandles(),
         };
     }
 
@@ -2238,8 +2246,8 @@ const App = struct {
         try AgentAppRuntime.appendTransientRuntimeContextMessage(self, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
-    pub fn appendStaticContextMessage(self: *App, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
-        try AgentAppRuntime.appendStaticContextMessage(self, arena, project_context, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    pub fn appendStaticContextMessage(self: *App, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+        try AgentAppRuntime.appendStaticContextMessage(self, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
         if (comptime host_target.is_wasm) {
             try messages.append(arena, .{
                 .role = .system,
@@ -4656,6 +4664,7 @@ test {
     _ = @import("core/agent/runtime/execution_memory.zig");
     _ = @import("core/agent/runtime/tool_admission.zig");
     _ = @import("core/agent/runtime/prompt_context.zig");
+    _ = @import("core/agent/runtime/runtime_context.zig");
     _ = @import("core/app/app_agent_runtime.zig");
     _ = @import("core/app/app_auth_runtime.zig");
     _ = auth_runtime;

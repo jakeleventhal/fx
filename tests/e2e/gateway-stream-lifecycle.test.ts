@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   AMBIGUOUS_CAPABILITY_CLAUSES,
@@ -597,7 +597,16 @@ function advertisedSkillPath(body: string, location: string): string {
   const prefix = `Root ${match[1]}: `;
   const root = taggedBlock(body, "available_skills").split("\n").find((line) => line.startsWith(prefix));
   if (!root) throw new Error(`Missing root for ${location}`);
-  return join(root.slice(prefix.length), decodeURIComponent(match[2]!));
+  // A root inside the workspace is shown relative to the turn context's workspace_root.
+  const shown = root.slice(prefix.length);
+  const base = isAbsolute(shown) ? shown : join(turnContextWorkspaceRoot(body), shown);
+  return join(base, decodeURIComponent(match[2]!));
+}
+
+function turnContextWorkspaceRoot(body: string): string {
+  const match = /^workspace_root: (.+)$/m.exec(promptText(body));
+  if (!match) throw new Error("Missing workspace_root in the turn context");
+  return match[1]!;
 }
 
 function toolResultOutput(body: string, callId: string): string {
@@ -1783,7 +1792,7 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requestCount()).toBe(1);
       expect(prompt).toContain("LINKED_INSTRUCTION_SENTINEL");
       expect(prompt).toContain(
-        `<project-rules from="${join(root.workspace, "AGENTS.md")}">`,
+        '<project-rules from="AGENTS.md">',
       );
       expect(prompt).toContain("LINKED_SKILL_SENTINEL");
       expect(prompt).toContain(
@@ -2041,7 +2050,8 @@ describe("gateway stream lifecycle", () => {
       expect(promptText(gateway.requests[0]!.body)).toContain(
         'reason="oversized rule file"',
       );
-      expect(promptText(gateway.requests[1]!.body)).toContain(
+      // Rules and omissions a tool call reaches ride on its result (D93).
+      expect(toolResultOutput(gateway.requests[1]!.body, "project_omission_read")).toContain(
         'reason="selection cap"',
       );
     } finally {
@@ -3526,8 +3536,13 @@ describe("gateway stream lifecycle", () => {
         expect(deferredBody).toContain(buildRule);
         expect(deferredBody).not.toContain(siblingRule);
         expect(deferredBody.indexOf(rootRule)).toBeLessThan(deferredBody.indexOf(buildRule));
-        expect(toolResultOutput(deferredBody, firstCallId)).toBe(
-          "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.",
+        // The deferred call's result carries the rules it waited for (D93).
+        const deferredResult = toolResultOutput(deferredBody, firstCallId);
+        expect(deferredResult.startsWith(
+          "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.\n\n",
+        )).toBe(true);
+        expect(deferredResult).toContain(
+          `<scoped-rules from="build/AGENTS.md" scope="build">\n${buildRule}\n</scoped-rules>`,
         );
         expect(existsSync(targetPath)).toBe(true);
 
@@ -8804,7 +8819,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(gateway.requests[3]!.headers.get("ai-language-model-id")).toBe(smallModel);
       expect(gateway.requests[4]!.headers.get("ai-language-model-id")).toBe(MODEL);
       for (const catalog of [parentCatalog, childCatalog]) {
-        expect(catalog).toContain(resumedWorkspace);
+        // A root inside the workspace is shown relative to it.
+        expect(catalog).toContain("Root 0: .agents/skills\n");
         expect(catalog).not.toContain("original-workspace-only");
         for (const name of skillNames) expect(catalog).toContain(`- ${name}:`);
       }

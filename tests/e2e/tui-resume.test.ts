@@ -1558,6 +1558,14 @@ function gatewaySawNote(gateway: ReturnType<typeof startFakeGateway>): boolean {
   );
 }
 
+/** Where the stale-handle note sits in a request: the role of each message that carries it. */
+function noteRoles(body: unknown): string[] {
+  const parsed = typeof body === "string" ? JSON.parse(body) : body;
+  return ((parsed as { prompt?: { role: string; content: unknown }[] }).prompt ?? [])
+    .filter((message) => JSON.stringify(message.content).includes(STALE_HANDLE_NOTE))
+    .map((message) => message.role);
+}
+
 test.skipIf(!tmuxAvailable())(
   "resume after process restart warns the model about stale shell handles",
   async () => {
@@ -1596,7 +1604,10 @@ test.skipIf(!tmuxAvailable())(
       await active.kill();
       active = null;
 
-      resumedGateway = startFakeGateway([fakeGatewayFinalText("STALE_NOTE_PHASE2_DONE")]);
+      resumedGateway = startFakeGateway([
+        fakeGatewayFinalText("STALE_NOTE_PHASE2_DONE"),
+        fakeGatewayFinalText("STALE_NOTE_PHASE3_DONE"),
+      ]);
       active = await TmuxSession.create({
         cmd: `${FX_BIN} --resume-last`,
         cwd: workspace,
@@ -1609,6 +1620,15 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Is the watcher still running?");
       await waitForScrollback(active, "STALE_NOTE_PHASE2_DONE");
       expect(gatewaySawNote(resumedGateway)).toBe(true);
+      // The note rides on the resumed turn's own message, so the instructions
+      // stay as they were cached; the next turn of this process keeps that one
+      // copy and adds no other (D93).
+      await active.sendText("And now?");
+      await waitForScrollback(active, "STALE_NOTE_PHASE3_DONE");
+      expect(resumedGateway.requests).toHaveLength(2);
+      for (const request of resumedGateway.requests) {
+        expect(noteRoles(request.body)).toEqual(["user"]);
+      }
 
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
