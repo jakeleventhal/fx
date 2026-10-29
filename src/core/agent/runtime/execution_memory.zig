@@ -1212,7 +1212,8 @@ pub fn captureCommittedFilePresentation(
             .kind = diff_mod.presentationLineKind(line.op),
             .old_line = line.old_line,
             .new_line = line.new_line,
-            .text = try alloc.dupe(u8, line.text),
+            // Saved text must be valid UTF-8; see `text_utils.dupeValidUtf8`.
+            .text = try text_utils.dupeValidUtf8(alloc, line.text),
         };
         copied_lines += 1;
     }
@@ -1328,6 +1329,29 @@ test "committed file presentation without a full view keeps only its preview" {
     try std.testing.expectEqual(@as(usize, 2), presentation.lines.len);
     try std.testing.expectEqualStrings("before", presentation.lines[0].text);
     try std.testing.expect(types.committedFilePresentationContentSourceValid(presentation));
+}
+
+test "committed file presentation saves a file's invalid UTF-8 as visible escapes" {
+    const alloc = std.testing.allocator;
+    var handoff = testCommittedEditHandoff("keep\n\xff\xfe\tx\nold\n", "keep\n\xff\xfe\tx\nnew\n");
+    const preview_lines = [_]diff_mod.PreviewLine{
+        .{ .op = .context, .old_line = 2, .new_line = 2, .text = "\xff\xfe\tx" },
+        .{ .op = .addition, .new_line = 3, .text = "new" },
+    };
+    handoff.preview.lines = &preview_lines;
+
+    const presentation = try captureCommittedFilePresentation(alloc, handoff);
+    defer types.freeCommittedFilePresentation(alloc, presentation);
+
+    // The session store accepts only valid UTF-8; the tab stays for the
+    // renderer, which also handles control bytes.
+    try std.testing.expectEqualStrings("\\xff\\xfe\tx", presentation.lines[0].text);
+    var escaped_row = false;
+    for (presentation.review_lines.?) |row| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(row.text));
+        if (std.mem.eql(u8, row.text, "\\xff\\xfe\tx")) escaped_row = true;
+    }
+    try std.testing.expect(escaped_row);
 }
 
 fn toolCall(id: []const u8, name: []const u8, args: []const u8) ToolCall {
