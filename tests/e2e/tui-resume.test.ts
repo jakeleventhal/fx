@@ -5858,6 +5858,34 @@ test("manual upgrade output links stable notes and dev changes", async () => {
   }
 }, UPGRADE_TIMEOUT);
 
+test("update runs the manual upgrade", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-update-alias-")));
+  const argvLogPath = join(root, "upgrade-argv.log");
+  const installedFx = join(root, "fx");
+  const home = join(root, "home");
+  mkdirSync(home);
+  const release = startUpgradeServer(root, argvLogPath);
+  copyFileSync(FX_BIN, installedFx);
+  chmodSync(installedFx, 0o755);
+
+  try {
+    const update = Bun.spawn([installedFx, "update", "--channel", "stable"], {
+      env: { ...process.env, HOME: home, FX_E2E_UPGRADE_BASE_URL: release.baseUrl },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const exitCode = await update.exited;
+    expect(exitCode).toBe(0);
+    expect(await new Response(update.stdout).text()).toContain(
+      "notes: https://fx.sh/changelog#v9.9.9",
+    );
+    expect(readFileSync(installedFx, "utf8")).toStartWith("#!/bin/sh");
+  } finally {
+    release.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, UPGRADE_TIMEOUT);
+
 test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g reloads the background-installed binary and resumes",
   async () => {
