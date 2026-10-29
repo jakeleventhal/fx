@@ -49,6 +49,11 @@ import {
 const MODEL = "openai/gpt-5.5";
 const DEFAULT_MODEL = "spacexai/grok-4.7";
 const DELAY_MS = 32_500;
+// What the shell description tells the model to run for a service that
+// outlives fx; macOS has no setsid command (src/builtins/tools.zig).
+const DETACH_COMMAND = process.platform === "darwin"
+  ? "perl -MPOSIX -e 'fork&&exit;setsid;exec@ARGV' <cmd> >log 2>&1 &"
+  : "setsid <cmd> >log 2>&1 &";
 const MALFORMED_ARGUMENTS = '{"depth":1,"depth":2}';
 const MALFORMED_CALL_ID = "malformed_ask_1";
 const MALFORMED_TOOL_NAME = "ask_user_question";
@@ -1153,7 +1158,7 @@ describe("gateway stream lifecycle", () => {
       expectOnlyLeadingSystemMessages(gateway.requests[0]!.body);
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "shell")?.description).toBe(
-        "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user's startup files applied: their aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over to the next call. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors.",
+        `Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Owned sessions end when fx exits; & and nohup jobs end with their command. To keep a service running, use \`${DETACH_COMMAND}\` and check it is ready in that call. Each call starts a new shell with the user's startup files: aliases, functions, and PATH work, but cd, export, and alias changes do not carry over. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors.`,
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
@@ -5477,6 +5482,116 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         if (!isProcessAlive(pid)) continue;
         try {
           process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a service started the way the shell description says keeps serving after fx ask exits", async () => {
+    const root = createFixtureRoot("shell-setsid-service");
+    const tracePath = join(root.root, "trace.log");
+    const pidPath = join(root.workspace, "service.pid");
+    const callId = "shell_setsid_service_start";
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const address = probe.address();
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    if (address === null || typeof address === "string") throw new Error("no loopback port");
+    const port = address.port;
+    const serverPath = join(root.root, "service.py");
+    const logPath = join(root.root, "service.log");
+    // A bare socket server. http.server looks up the host name between bind
+    // and listen, which can outlast the call's timeout on macOS runners.
+    writeFileSync(
+      serverPath,
+      [
+        "import os, socket, sys",
+        "with open(sys.argv[2], 'w') as f: f.write(str(os.getpid()))",
+        "server = socket.socket()",
+        "server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
+        "server.bind(('127.0.0.1', int(sys.argv[1])))",
+        "server.listen()",
+        "while True:",
+        "    conn, _ = server.accept()",
+        "    try:",
+        "        if conn.recv(65536):",
+        "            conn.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nok')",
+        "    except OSError:",
+        "        pass",
+        "    conn.close()",
+        "",
+      ].join("\n"),
+    );
+    let step = 0;
+    let started: ShellResult | null = null;
+    let servicePid: number | null = null;
+    let gatewayObservationError: unknown;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0: {
+          // Run exactly the command the description gives the model, so the
+          // test fails when that advice does not work on this platform.
+          const description = toolByName(parseGatewayRequest(body), "shell")?.description ?? "";
+          const advice = /To keep a service running, use `([^`]+)`/.exec(description)?.[1];
+          if (!advice?.includes("<cmd>") || !advice.includes(">log")) {
+            gatewayObservationError = new Error(`the shell description gives no detach command: ${advice}`);
+            return fakeGatewayFinalText("No command to run.");
+          }
+          const command = [
+            advice
+              .replace("<cmd>", `python3 ${JSON.stringify(serverPath)} ${port} ${JSON.stringify(pidPath)}`)
+              .replace(">log", `>${JSON.stringify(logPath)}`),
+            `until python3 -c 'import socket; socket.create_connection(("127.0.0.1", ${port}), 1).close()' 2>/dev/null; do sleep 0.1; done`,
+            "printf SERVICE-READY",
+          ].join("\n");
+          return fakeShellRun(callId, command, { profile: "clean", timeout_ms: 15_000 });
+        }
+        case 1:
+          try {
+            started = shellResult(body, callId);
+          } catch (error) {
+            gatewayObservationError = error;
+          }
+          return fakeGatewayFinalText("The service is running.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Start the service and leave it running."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 25_000,
+        },
+      );
+      if (gatewayObservationError) throw gatewayObservationError;
+      servicePid = Number.parseInt(readFileSync(pidPath, "utf8"), 10);
+      expect(result.code).toBe(0);
+      expect(gateway.requestCount()).toBe(2);
+      expect(started).toMatchObject({
+        state: "completed",
+        exit_code: 0,
+        error: null,
+        output_delta: "SERVICE-READY",
+      });
+      // Connect only after fx has exited, as a later check of the machine would.
+      await Bun.sleep(500);
+      const response = await fetch(`http://127.0.0.1:${port}/`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("ok");
+    } finally {
+      if (existsSync(logPath)) {
+        const serviceLog = readFileSync(logPath, "utf8");
+        if (serviceLog.length > 0) console.error(`service.log:\n${serviceLog}`);
+      }
+      if (servicePid !== null && Number.isSafeInteger(servicePid) && servicePid > 0) {
+        try {
+          process.kill(servicePid, "SIGKILL");
         } catch {}
       }
       gateway.stop();
