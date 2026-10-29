@@ -906,7 +906,7 @@ const CancellationJoinTest = struct {
         const turn = self.turn.?;
         Owner.phaseTransition(self.owner, "child", "work", .awaiting_approval) catch
             return error.PermissionRegistrationFailed;
-        self.owner.approvals.registerTool("approval", "child", "parent", "work", request, &.{}, turn.approval_worker_route.?, 1) catch
+        self.owner.approvals.registerTool("approval", "child", "parent", "work", request, null, &.{}, turn.approval_worker_route.?, 1) catch
             return error.PermissionRegistrationFailed;
         self.request_id = request.id;
         self.registered.set(io_mod.getIo());
@@ -1161,6 +1161,7 @@ test "worker detach invalidates approval routes before worker deinit" {
         "root",
         "work",
         .{ .id = 9, .label = "review" },
+        null,
         &.{},
         route,
         1,

@@ -274,6 +274,7 @@ pub const TurnContext = struct {
                 work_id,
                 prepared,
             ),
+            .call = call,
             .grants = grant_offer orelse &.{grant},
         };
         return self.worker.requestPermissionBlockingObserved(
@@ -287,6 +288,7 @@ pub const TurnContext = struct {
     const PermissionObservation = struct {
         turn: *TurnContext,
         stable_id: [64]u8,
+        call: types.ToolCall,
         grants: []const types.PermissionGrant,
 
         fn observe(
@@ -303,6 +305,7 @@ pub const TurnContext = struct {
                 self.turn.alloc,
                 &self.stable_id,
                 request,
+                self.call,
                 self.grants,
             ) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -364,6 +367,7 @@ pub const TurnContext = struct {
         alloc: Allocator,
         stable_request_id: []const u8,
         request: permission_request.PermissionRequest,
+        call: ?types.ToolCall,
         grants: []const types.PermissionGrant,
     ) (approval_registry_mod.Error || authority_mod.Error)!void {
         const registry = self.approval_registry orelse
@@ -381,6 +385,7 @@ pub const TurnContext = struct {
             authority.root_id,
             work_id,
             request,
+            call,
             grants,
             worker_route,
             io_mod.milliTimestamp(),

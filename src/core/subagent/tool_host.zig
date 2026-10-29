@@ -231,6 +231,14 @@ pub const Runtime = struct {
         return self.approvals.firstPendingRequest(alloc, self.root_id);
     }
 
+    pub fn pendingApprovalRequestForChild(
+        self: *Runtime,
+        alloc: Allocator,
+        child_id: []const u8,
+    ) !?approval_registry.PendingRequest {
+        return self.approvals.pendingRequestForChild(alloc, child_id);
+    }
+
     pub fn resolveApproval(
         self: *Runtime,
         options: ApprovalResolveOptions,

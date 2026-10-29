@@ -621,6 +621,10 @@ class AcpClient {
   private pendingNewSessions = new Set<number | string>();
   readonly rawLines: string[] = [];
   private permissionOptionId: "allow_once" | "allow_always" | "reject_once" = "reject_once";
+  private permissionHandler?: (
+    params: any,
+    id: number | string,
+  ) => "allow_once" | "allow_always" | "reject_once" | undefined;
   private elicitationHandler?: (
     params: Record<string, unknown>,
     id: number | string,
@@ -691,6 +695,23 @@ class AcpClient {
 
   setPermissionOption(optionId: "allow_once" | "allow_always" | "reject_once"): void {
     this.permissionOptionId = optionId;
+  }
+
+  /// Chooses the answer to each `session/request_permission`, or returns
+  /// undefined to hold the request until `answerPermission`.
+  setPermissionHandler(handler: (
+    params: any,
+    id: number | string,
+  ) => "allow_once" | "allow_always" | "reject_once" | undefined): void {
+    this.permissionHandler = handler;
+  }
+
+  answerPermission(id: number | string, optionId: "allow_once" | "allow_always" | "reject_once"): void {
+    this.send({
+      jsonrpc: "2.0",
+      id,
+      result: { outcome: { outcome: "selected", optionId } },
+    });
   }
 
   setElicitationHandler(handler: (
@@ -773,11 +794,10 @@ class AcpClient {
       }
     }
     if (message.method === "session/request_permission" && message.id !== undefined) {
-      this.send({
-        jsonrpc: "2.0",
-        id: message.id,
-        result: { outcome: { outcome: "selected", optionId: this.permissionOptionId } },
-      });
+      const optionId = this.permissionHandler
+        ? this.permissionHandler(message.params ?? {}, message.id)
+        : this.permissionOptionId;
+      if (optionId !== undefined) this.answerPermission(message.id, optionId);
     }
     if (message.method === "mcp/message" && message.id !== undefined) {
       this.mcpMessages.push(message);
@@ -9609,6 +9629,203 @@ describe("acp: model-independent", () => {
         expect(client.stderr).toBe("");
       } finally {
         heldChild.resolve(finalText("late child cleanup"));
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP sends a subagent's permission request on the parent session and applies the answer",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-permission-");
+      const childTask = "Write the child marker file.";
+      const createId = "acp_permission_child";
+      const writeId = "child_write_1";
+      const target = join(root.workspace, "child-marker.txt");
+      const gateway = startDynamicFakeGateway((body) => {
+        if (body.includes(`\"toolCallId\":\"${createId}\"`)) {
+          return finalText("ACP_SUBAGENT_PERMISSION_DONE");
+        }
+        if (acpPromptText(body).includes(childTask)) {
+          if (body.includes(`\"toolCallId\":\"${writeId}\"`)) return finalText("child write finished");
+          return fileToolCall(writeId, "child-marker.txt", "child\n");
+        }
+        return fakeGatewayToolCall(createId, "subagent", {
+          request: { action: "run", task: childTask },
+        });
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const parentSession = await startAutoSession(client, true);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
+        client.setPermissionOption("allow_once");
+        const result = await runPrompt(client, "Delegate the marker write.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        const childRequests = result.messages.filter((message: any) =>
+          message.method === "session/request_permission" && message.params._meta?.fx?.subagent
+        );
+        expect(childRequests).toHaveLength(1);
+        const dispatched = client.hookEvents.find(event => event.type === "delegation" && event.data.phase === "dispatched");
+        const childSession = dispatched.data.childSessionId;
+        const permission = childRequests[0].params;
+        expect(permission.sessionId).toBe(parentSession);
+        expect(permission._meta.fx.subagent).toEqual({
+          sessionId: childSession,
+          workId: dispatched.data.workId,
+          toolCallId: writeId,
+        });
+        expect(permission.toolCall.toolCallId).toBe(`${childSession}/${writeId}`);
+        expect(permission.toolCall.status).toBe("pending");
+        expect(permission.toolCall.rawInput.path).toBe("child-marker.txt");
+        expect(permission.options.map((option: any) => option.optionId)).toEqual([
+          "allow_once",
+          "allow_always",
+          "reject_once",
+        ]);
+        expect(readFileSync(target, "utf8")).toBe("child\n");
+        expect(JSON.stringify(result.messages)).toContain("ACP_SUBAGENT_PERMISSION_DONE");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP routes concurrent subagent permission answers to the child that asked",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-permission-pair-");
+      const children = [
+        { create: "acp_child_rejected", task: "Write the rejected marker.", write: "child_write_rejected", path: "rejected.txt" },
+        { create: "acp_child_allowed", task: "Write the allowed marker.", write: "child_write_allowed", path: "allowed.txt" },
+      ];
+      const gateway = startDynamicFakeGateway((body) => {
+        if (children.every(child => body.includes(`\"toolCallId\":\"${child.create}\"`))) {
+          return finalText("ACP_SUBAGENT_PAIR_DONE");
+        }
+        const text = acpPromptText(body);
+        for (const child of children) {
+          if (!text.includes(child.task)) continue;
+          if (body.includes(`\"toolCallId\":\"${child.write}\"`)) return finalText(`${child.path} finished`);
+          return fileToolCall(child.write, child.path, `${child.path}\n`);
+        }
+        return fakeGatewaySse([
+          ...children.map(child => ({
+            type: "tool-call",
+            toolCallId: child.create,
+            toolName: "subagent",
+            input: { request: { action: "run", task: child.task } },
+          })),
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]);
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const parentSession = await startAutoSession(client, true);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
+        const held: Array<{ id: number | string; params: any }> = [];
+        const answerFor = (params: any) =>
+          params.toolCall.rawInput.path === "rejected.txt" ? "reject_once" : "allow_once";
+        client.setPermissionHandler((params, id) => {
+          if (!params._meta?.fx?.subagent) return "allow_once";
+          held.push({ id, params });
+          // Both children wait at once before either gets an answer.
+          if (held.length < 2) return undefined;
+          client.answerPermission(held[0]!.id, answerFor(held[0]!.params));
+          return answerFor(params);
+        });
+        const result = await runPrompt(client, "Delegate both marker writes.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(held).toHaveLength(2);
+        expect(held.every(request => request.params.sessionId === parentSession)).toBe(true);
+        const childSessions = new Set(held.map(request => request.params._meta.fx.subagent.sessionId));
+        expect(childSessions.size).toBe(2);
+        expect(childSessions.has(parentSession)).toBe(false);
+        expect(existsSync(join(root.workspace, "rejected.txt"))).toBe(false);
+        expect(readFileSync(join(root.workspace, "allowed.txt"), "utf8")).toBe("allowed.txt\n");
+        expect(JSON.stringify(result.messages)).toContain("ACP_SUBAGENT_PAIR_DONE");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP cancellation withdraws an open subagent permission request",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-permission-cancel-");
+      const childTask = "Write the cancelled marker.";
+      const followUp = "Confirm the server still answers.";
+      const target = join(root.workspace, "cancelled.txt");
+      const gateway = startDynamicFakeGateway((body) => {
+        if (acpLatestPromptText(body).includes(followUp)) return finalText("ACP_SUBAGENT_PERMISSION_CANCEL_OK");
+        if (acpPromptText(body).includes(childTask)) {
+          if (body.includes("\"toolCallId\":\"child_write_cancelled\"")) return finalText("child stopped");
+          return fileToolCall("child_write_cancelled", "cancelled.txt", "cancelled\n");
+        }
+        if (body.includes("\"toolCallId\":\"acp_cancelled_child\"")) return finalText("parent stopped");
+        return fakeGatewayToolCall("acp_cancelled_child", "subagent", {
+          request: { action: "run", task: childTask },
+        });
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startAutoSession(client, true);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
+        let heldId: number | string | undefined;
+        client.setPermissionHandler((params, id) => {
+          if (!params._meta?.fx?.subagent) return "allow_once";
+          heldId = id;
+          return undefined;
+        });
+
+        const promptId = 6820;
+        const cancelId = 6821;
+        sendPrompt(client, promptId, "Delegate the cancelled marker write.");
+        const deadline = Date.now() + TIMEOUT;
+        while (heldId === undefined && Date.now() < deadline) {
+          try {
+            await client.readLine(Math.max(100, deadline - Date.now()));
+          } catch (err) {
+            if (!(err instanceof AcpReadTimeoutError)) throw err;
+          }
+        }
+        expect(heldId).toBeDefined();
+        client.send({ jsonrpc: "2.0", id: cancelId, method: "session/cancel", params: {} });
+        const { responses, messages } = await readUntilResponses(client, [promptId, cancelId]);
+        expect(responses.get(cancelId)?.result).toBeNull();
+        expect(responses.get(promptId)?.result?.stopReason).toBe("cancelled");
+        expect(messages.some((message: any) =>
+          message.method === "$/cancel_request" && message.params?.requestId === heldId
+        )).toBe(true);
+
+        // A late answer to the withdrawn request changes nothing.
+        client.answerPermission(heldId!, "allow_once");
+        const next = await runPrompt(client, followUp, TIMEOUT);
+        expect(next.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(next.messages)).toContain("ACP_SUBAGENT_PERMISSION_CANCEL_OK");
+        expect(existsSync(target)).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

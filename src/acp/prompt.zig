@@ -46,6 +46,7 @@ const permission_auto_classifier = @import("../core/permissions/auto_classifier.
 const auto_classifier_context = @import("../core/permissions/auto_classifier_context.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
 const permission_request = @import("../core/permissions/permission_request.zig");
+const permission_requests = @import("permission_requests.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
@@ -1310,6 +1311,16 @@ pub fn runSubagentChild(
     defer child_projection.deinit(alloc);
     var skill_catalog = state.skills.acquireCatalog();
     defer skill_catalog.deinit();
+    // The child's approvals reach the client on the parent's session while
+    // this turn runs.
+    var approvals = permission_requests.ChildForwarder{
+        .state = state,
+        .host = subagent_host,
+        .session_id = session_id,
+        .child_id = turn.child_id orelse "",
+    };
+    if (comptime !host_target.is_wasm) if (turn.child_id != null) approvals.start();
+    defer approvals.stop();
     return subagent_agent_adapter.run(.{
         .host = subagent_host,
         .tool_context = ctx.toolContext(),
@@ -2388,9 +2399,10 @@ fn requestAcpPermission(
     _: ?*const diff_mod.FileReview,
     _: ?[]const PermissionGrant,
 ) anyerror!permission_request.OwnedPermissionResponse {
+    // Malformed arguments fail before the client sees a pending card.
     var validated_arguments: std.Io.Writer.Allocating = .init(alloc);
     defer validated_arguments.deinit();
-    try writeValidatedToolArguments(alloc, &validated_arguments.writer, call.arguments_json);
+    try permission_requests.writeValidatedToolArguments(alloc, &validated_arguments.writer, call.arguments_json);
 
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const request_id = server.beginPermissionRequest(ctx.state) orelse return error.PermissionRequestAlreadyPending;
@@ -2405,25 +2417,12 @@ fn requestAcpPermission(
 
     var params: std.Io.Writer.Allocating = .init(alloc);
     defer params.deinit();
-    try params.writer.writeAll("{\"sessionId\":");
-    try jsonrpc.writeJsonStr(ctx.session_id, &params.writer);
-    try params.writer.writeAll(",\"toolCall\":{\"toolCallId\":");
-    try jsonrpc.writeJsonStr(tool_call_id, &params.writer);
-    try params.writer.writeAll(",\"name\":");
-    try jsonrpc.writeJsonStr(acpToolName(call.name), &params.writer);
-    try params.writer.writeAll(",\"title\":");
-    try jsonrpc.writeJsonStr(request.label, &params.writer);
-    try params.writer.writeAll(",\"kind\":");
-    try jsonrpc.writeJsonStr(mapToolKind(call.name).jsonString(), &params.writer);
-    try params.writer.writeAll(",\"status\":\"pending\",\"rawInput\":");
-    try params.writer.writeAll(validated_arguments.written());
-    try params.writer.writeAll("},\"options\":[");
-    try writePermissionOption(&params.writer, "allow_once", "Allow once", "allow_once");
-    try params.writer.writeByte(',');
-    try writePermissionOption(&params.writer, "allow_always", "Allow for this session", "allow_always");
-    try params.writer.writeByte(',');
-    try writePermissionOption(&params.writer, "reject_once", "Reject", "reject_once");
-    try params.writer.writeAll("]}");
+    try permission_requests.writeParams(alloc, &params.writer, .{
+        .session_id = ctx.session_id,
+        .tool_call_id = tool_call_id,
+        .call = call,
+        .title = request.label,
+    });
 
     try ctx.state.writer.writeRequest(
         alloc,
@@ -2433,28 +2432,6 @@ fn requestAcpPermission(
     );
     const decision = server.awaitPermissionDecision(ctx.state, request_id);
     return permission_request.OwnedPermissionResponse.init(alloc, decision, null);
-}
-
-fn writeValidatedToolArguments(alloc: Allocator, writer: *std.Io.Writer, arguments_json: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch
-        return error.InvalidToolArgumentsJson;
-    defer parsed.deinit();
-    try std.json.Stringify.value(parsed.value, .{}, writer);
-}
-
-fn writePermissionOption(
-    writer: *std.Io.Writer,
-    option_id: []const u8,
-    name: []const u8,
-    kind: []const u8,
-) !void {
-    try writer.writeAll("{\"optionId\":");
-    try jsonrpc.writeJsonStr(option_id, writer);
-    try writer.writeAll(",\"name\":");
-    try jsonrpc.writeJsonStr(name, writer);
-    try writer.writeAll(",\"kind\":");
-    try jsonrpc.writeJsonStr(kind, writer);
-    try writer.writeByte('}');
 }
 
 fn describeToolAction(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -4190,14 +4167,14 @@ test "ACP permission arguments are validated and reserialized before emission" {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    try writeValidatedToolArguments(alloc, &out.writer, " { \"path\" : \"README.md\" } ");
+    try permission_requests.writeValidatedToolArguments(alloc, &out.writer, " { \"path\" : \"README.md\" } ");
     try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", out.written());
 
     var malformed: std.Io.Writer.Allocating = .init(alloc);
     defer malformed.deinit();
     try std.testing.expectError(
         error.InvalidToolArgumentsJson,
-        writeValidatedToolArguments(alloc, &malformed.writer, "{\"path\":}"),
+        permission_requests.writeValidatedToolArguments(alloc, &malformed.writer, "{\"path\":}"),
     );
     try std.testing.expectEqual(@as(usize, 0), malformed.written().len);
 }

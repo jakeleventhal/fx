@@ -62,12 +62,44 @@ pub const WorkerRoute = struct {
     }
 };
 
+/// The child's tool call that needs approval, so a host that shows the
+/// request outside the child can describe the call.
+pub const ToolCall = struct {
+    id: []u8,
+    name: []u8,
+    arguments_json: []u8,
+
+    fn dupe(alloc: Allocator, call: types.ToolCall) Allocator.Error!ToolCall {
+        const id = try alloc.dupe(u8, call.id);
+        errdefer alloc.free(id);
+        const name = try alloc.dupe(u8, call.name);
+        errdefer alloc.free(name);
+        return .{
+            .id = id,
+            .name = name,
+            .arguments_json = try alloc.dupe(u8, call.arguments_json),
+        };
+    }
+
+    fn deinit(self: *ToolCall, alloc: Allocator) void {
+        alloc.free(self.id);
+        alloc.free(self.name);
+        alloc.free(self.arguments_json);
+        self.* = undefined;
+    }
+
+    pub fn view(self: ToolCall) types.ToolCall {
+        return .{ .id = self.id, .name = self.name, .arguments_json = self.arguments_json };
+    }
+};
+
 const Binding = struct {
     request_id: []u8,
     child_id: []u8,
     root_id: []u8,
     work_id: []u8,
     request: permission_request.OwnedPermissionRequest,
+    tool_call: ?ToolCall,
     worker: WorkerRoute,
     worker_request_id: u64,
 
@@ -77,6 +109,7 @@ const Binding = struct {
         alloc.free(self.root_id);
         alloc.free(self.work_id);
         self.request.deinit(alloc);
+        if (self.tool_call) |*call| call.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -84,13 +117,45 @@ const Binding = struct {
 pub const PendingRequest = struct {
     request_id: []u8,
     child_id: []u8,
+    work_id: []u8,
     request: permission_request.OwnedPermissionRequest,
+    tool_call: ?ToolCall,
 
     pub fn deinit(self: *PendingRequest, alloc: Allocator) void {
         alloc.free(self.request_id);
         alloc.free(self.child_id);
+        alloc.free(self.work_id);
         self.request.deinit(alloc);
+        if (self.tool_call) |*call| call.deinit(alloc);
         self.* = undefined;
+    }
+
+    fn dupe(alloc: Allocator, binding: *const Binding) Error!PendingRequest {
+        const request_id = try alloc.dupe(u8, binding.request_id);
+        errdefer alloc.free(request_id);
+        const child_id = try alloc.dupe(u8, binding.child_id);
+        errdefer alloc.free(child_id);
+        const work_id = try alloc.dupe(u8, binding.work_id);
+        errdefer alloc.free(work_id);
+        var tool_call = if (binding.tool_call) |call|
+            try ToolCall.dupe(alloc, call.view())
+        else
+            null;
+        errdefer if (tool_call) |*call| call.deinit(alloc);
+        const request = permission_request.OwnedPermissionRequest.dupe(
+            alloc,
+            binding.request.view(),
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.CommitFailed,
+        };
+        return .{
+            .request_id = request_id,
+            .child_id = child_id,
+            .work_id = work_id,
+            .request = request,
+            .tool_call = tool_call,
+        };
     }
 };
 
@@ -117,22 +182,24 @@ pub const Registry = struct {
         if (self.closed) return error.RegistryClosed;
         for (self.bindings.items) |*binding| {
             if (!std.mem.eql(u8, binding.root_id, root_id)) continue;
-            const request_id = try alloc.dupe(u8, binding.request_id);
-            errdefer alloc.free(request_id);
-            const child_id = try alloc.dupe(u8, binding.child_id);
-            errdefer alloc.free(child_id);
-            const request = permission_request.OwnedPermissionRequest.dupe(
-                alloc,
-                binding.request.view(),
-            ) catch |err| return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.CommitFailed,
-            };
-            return .{
-                .request_id = request_id,
-                .child_id = child_id,
-                .request = request,
-            };
+            return try PendingRequest.dupe(alloc, binding);
+        }
+        return null;
+    }
+
+    /// The approval one child is waiting on, if any. A child's worker holds
+    /// at most one pending request at a time.
+    pub fn pendingRequestForChild(
+        self: *Registry,
+        alloc: Allocator,
+        child_id: []const u8,
+    ) Error!?PendingRequest {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.closed) return error.RegistryClosed;
+        for (self.bindings.items) |*binding| {
+            if (!std.mem.eql(u8, binding.child_id, child_id)) continue;
+            return try PendingRequest.dupe(alloc, binding);
         }
         return null;
     }
@@ -144,6 +211,7 @@ pub const Registry = struct {
         root_id: []const u8,
         work_id: []const u8,
         request: permission_request.PermissionRequest,
+        tool_call: ?types.ToolCall,
         _: []const types.PermissionGrant,
         worker: WorkerRoute,
         _: i64,
@@ -176,6 +244,11 @@ pub const Registry = struct {
             var value = owned_request;
             value.deinit(self.alloc);
         }
+        var owned_tool_call = if (tool_call) |call|
+            try ToolCall.dupe(self.alloc, call)
+        else
+            null;
+        errdefer if (owned_tool_call) |*call| call.deinit(self.alloc);
         const owned_request_id = try self.alloc.dupe(u8, stable_request_id);
         errdefer self.alloc.free(owned_request_id);
         const owned_child_id = try self.alloc.dupe(u8, child_id);
@@ -190,6 +263,7 @@ pub const Registry = struct {
             .root_id = owned_root_id,
             .work_id = owned_work_id,
             .request = owned_request,
+            .tool_call = owned_tool_call,
             .worker = worker,
             .worker_request_id = request.id,
         });
@@ -355,4 +429,59 @@ test "approval identity is deterministic" {
         stableApprovalId("child", "work", prepared),
         stableApprovalId("child", "work", prepared),
     );
+}
+
+test "a child's pending approval is found by child and carries its tool call" {
+    const alloc = std.testing.allocator;
+    const Route = struct {
+        fn submit(
+            _: *anyopaque,
+            _: u64,
+            response: permission_request.OwnedPermissionResponse,
+            _: ?worker_runtime.WorkerRuntime.PermissionCommit,
+        ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+            var owned = response;
+            owned.deinit();
+            return .accepted;
+        }
+        fn cancel(_: *anyopaque) void {}
+        fn pin(_: *anyopaque) bool {
+            return true;
+        }
+        fn release(_: *anyopaque) void {}
+    };
+    var context: u8 = 0;
+    const route = WorkerRoute{
+        .context = &context,
+        .submit_fn = Route.submit,
+        .cancel_fn = Route.cancel,
+        .pin_fn = Route.pin,
+        .release_fn = Route.release,
+    };
+    var registry = Registry{ .alloc = alloc };
+    defer registry.deinit();
+    try registry.registerTool("first", "child-a", "root", "work-a", .{ .id = 1, .label = "write a" }, .{
+        .id = "call_a",
+        .name = "write_file",
+        .arguments_json = "{\"path\":\"a.txt\"}",
+    }, &.{}, route, 1);
+    try registry.registerTool("second", "child-b", "root", "work-b", .{ .id = 2, .label = "write b" }, null, &.{}, route, 1);
+
+    var second = (try registry.pendingRequestForChild(alloc, "child-b")).?;
+    defer second.deinit(alloc);
+    try std.testing.expectEqualStrings("second", second.request_id);
+    try std.testing.expectEqualStrings("work-b", second.work_id);
+    try std.testing.expect(second.tool_call == null);
+    try std.testing.expectEqualStrings("child-b", second.request.view().origin.subagent);
+
+    var first = (try registry.pendingRequestForChild(alloc, "child-a")).?;
+    defer first.deinit(alloc);
+    const call = first.tool_call.?.view();
+    try std.testing.expectEqualStrings("call_a", call.id);
+    try std.testing.expectEqualStrings("write_file", call.name);
+    try std.testing.expectEqualStrings("{\"path\":\"a.txt\"}", call.arguments_json);
+    try std.testing.expect(try registry.pendingRequestForChild(alloc, "child-c") == null);
+
+    try std.testing.expectEqual(ResolveResult.accepted, try registry.resolve("first", "child-a", .deny, null, 1));
+    try std.testing.expect(try registry.pendingRequestForChild(alloc, "child-a") == null);
 }
