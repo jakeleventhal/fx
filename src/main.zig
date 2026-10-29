@@ -3520,6 +3520,7 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "provider") or
         std.mem.eql(u8, command, "setup") or
         std.mem.eql(u8, command, "upgrade") or
+        std.mem.eql(u8, command, "update") or
         // Resolve a stored credential, which reads the platform key store out of process.
         std.mem.eql(u8, command, "status") or
         std.mem.eql(u8, command, "doctor") or
@@ -3533,6 +3534,7 @@ test "auth and upgrade commands use early threaded io without full entry config"
     const args = &.{@as([:0]const u8, "upgrade")};
     try std.testing.expect(!needsFullEntryConfig(args));
     try std.testing.expect(needsEarlyThreadedIo(args));
+    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "update")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "slack")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "login")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "logout")}));
