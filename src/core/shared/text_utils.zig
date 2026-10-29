@@ -1588,8 +1588,8 @@ test "appendTerminalSafeLine keeps tabs and shows a file's control sequences as 
     try appendTerminalSafeLine(alloc, &out, "a\tb\x1b[2J\x1b[Hc\u{9b}31md\xffe\r");
     try std.testing.expectEqualStrings("a\tb\\x1b[2J\\x1b[Hc\\u{009b}31md\\xffe", out.items);
 
-    // Only a trailing carriage return ends a line; one inside it would move
-    // the cursor back over the row's gutter.
+    // Only a trailing carriage return ends a line; one inside it would return
+    // to the start of the row and draw over its gutter.
     out.clearRetainingCapacity();
     try appendTerminalSafeLine(alloc, &out, "good\rbad\r");
     try std.testing.expectEqualStrings("good\\x0dbad", out.items);
